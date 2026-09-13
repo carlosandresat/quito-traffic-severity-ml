@@ -378,8 +378,14 @@ def run_ant_ingestion(
 
 
 if __name__ == "__main__":
-    # Default execution paths relative to project root
-    raw_dir = repo_root.parent / "datasets" / "transito" / "ANT"
+    # Default execution paths relative to project root (prioritizing data/raw)
+    if (repo_root / "data" / "raw" / "transito" / "ANT").exists():
+        raw_dir = repo_root / "data" / "raw" / "transito" / "ANT"
+    elif (repo_root / "data" / "raw" / "ANT").exists():
+        raw_dir = repo_root / "data" / "raw" / "ANT"
+    else:
+        raw_dir = repo_root.parent / "datasets" / "transito" / "ANT"
+
     proc_parquet = repo_root / "data" / "processed" / "ant_accidents_quito_unified.parquet"
     proc_csv = repo_root / "data" / "processed" / "ant_accidents_quito_unified.csv"
 

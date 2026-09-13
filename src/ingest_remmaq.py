@@ -238,7 +238,14 @@ def run_remmaq_ingestion(
 
 
 if __name__ == "__main__":
-    remmaq_path = repo_root.parent / "datasets" / "clima" / "REMMAQ"
+    # Default execution paths relative to project root (prioritizing data/raw)
+    if (repo_root / "data" / "raw" / "clima" / "REMMAQ").exists():
+        remmaq_path = repo_root / "data" / "raw" / "clima" / "REMMAQ"
+    elif (repo_root / "data" / "raw" / "REMMAQ").exists():
+        remmaq_path = repo_root / "data" / "raw" / "REMMAQ"
+    else:
+        remmaq_path = repo_root.parent / "datasets" / "clima" / "REMMAQ"
+
     proc_parquet = repo_root / "data" / "processed" / "remmaq_meteorology_hourly.parquet"
 
     run_remmaq_ingestion(remmaq_path, proc_parquet)

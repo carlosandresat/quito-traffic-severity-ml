@@ -72,7 +72,9 @@ quito-traffic-severity-ml/
 │   ├── spatiotemporal_join.py      # Spatial nearest-station matcher and hierarchical fallback
 │   └── run_pipeline.py             # End-to-end pipeline orchestrator and validation suite
 └── data/                           # Ignored by Git (data privacy policy)
-    ├── raw/                        # Symlink or reference to source datasets
+    ├── raw/                        # Raw source datasets (local copies)
+    │   ├── transito/ANT/           # ANT crash datasets (CSV 2017–2023, XLSX 2024, 2025, 2026)
+    │   └── clima/REMMAQ/           # REMMAQ validated hourly meteorological workbooks
     └── processed/                  # Generated Parquet and CSV research matrices
 ```
 

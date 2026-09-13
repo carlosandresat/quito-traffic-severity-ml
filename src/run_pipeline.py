@@ -93,9 +93,20 @@ def main():
     print("QUITO TRAFFIC ACCIDENT SEVERITY: END-TO-END DATA INTEGRATION")
     print("=" * 70)
 
-    # Paths configuration
-    raw_ant_dir = repo_root.parent / "datasets" / "transito" / "ANT"
-    raw_remmaq_dir = repo_root.parent / "datasets" / "clima" / "REMMAQ"
+    # Paths configuration (prioritize data/raw within project)
+    if (repo_root / "data" / "raw" / "transito" / "ANT").exists():
+        raw_ant_dir = repo_root / "data" / "raw" / "transito" / "ANT"
+    elif (repo_root / "data" / "raw" / "ANT").exists():
+        raw_ant_dir = repo_root / "data" / "raw" / "ANT"
+    else:
+        raw_ant_dir = repo_root.parent / "datasets" / "transito" / "ANT"
+
+    if (repo_root / "data" / "raw" / "clima" / "REMMAQ").exists():
+        raw_remmaq_dir = repo_root / "data" / "raw" / "clima" / "REMMAQ"
+    elif (repo_root / "data" / "raw" / "REMMAQ").exists():
+        raw_remmaq_dir = repo_root / "data" / "raw" / "REMMAQ"
+    else:
+        raw_remmaq_dir = repo_root.parent / "datasets" / "clima" / "REMMAQ"
 
     proc_dir = repo_root / "data" / "processed"
     proc_ant_parquet = proc_dir / "ant_accidents_quito_unified.parquet"
