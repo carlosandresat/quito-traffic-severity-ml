@@ -241,16 +241,16 @@ def plot_fig4_spatial_distributions(
     # Panel B: Distance Distribution
     ax1 = axes[1]
     sns.histplot(
-        df["distancia_clima_km"],
+        df["distancia_climatica_utilizada_km"],
         kde=True,
         color="#2b5c8f",
         ax=ax1,
         bins=35,
         stat="density"
     )
-    median_dist = df["distancia_clima_km"].median()
-    mean_dist = df["distancia_clima_km"].mean()
-    p90_dist = df["distancia_clima_km"].quantile(0.90)
+    median_dist = df["distancia_climatica_utilizada_km"].median()
+    mean_dist = df["distancia_climatica_utilizada_km"].mean()
+    p90_dist = df["distancia_climatica_utilizada_km"].quantile(0.90)
 
     ax1.axvline(median_dist, color="red", linestyle="--", linewidth=1.5, label=f"Median: {median_dist:.2f} km")
     ax1.axvline(mean_dist, color="green", linestyle="-.", linewidth=1.5, label=f"Mean: {mean_dist:.2f} km")
@@ -342,7 +342,7 @@ def plot_fig6_correlation_matrix(df: pd.DataFrame, output_path: Path) -> None:
     feature_cols = [
         "tmp", "hum", "vel", "pre", "rs",
         "lluvia_1h", "lluvia_acum_3h", "temp_delta_3h",
-        "hora", "distancia_clima_km",
+        "hora", "distancia_climatica_utilizada_km",
         "automovil", "motocicleta", "bus", "suma_de_vehiculos", "severidad"
     ]
     sub = df[feature_cols].dropna()
@@ -432,7 +432,7 @@ def generate_interactive_folium_map(
         <b>Crash ID:</b> {row.get('id_siniestro', 'N/A')}<br>
         <b>Date:</b> {row['fecha']} {row['hora_str']}<br>
         <b>Cause:</b> {row.get('causa_probable', 'N/A')[:40]}...<br>
-        <b>Nearest Station:</b> {row.get('estacion_clima_asignada', 'N/A')} ({row.get('distancia_clima_km', 0):.2f} km)<br>
+        <b>Nearest Station:</b> {row.get('estacion_climatica_utilizada', 'N/A')} ({row.get('distancia_climatica_utilizada_km', 0):.2f} km)<br>
         <b>Precipitation:</b> {row.get('lluvia_1h', 0):.1f} mm/h<br>
         <b>Temperature:</b> {row.get('tmp', 0):.1f} °C
         """

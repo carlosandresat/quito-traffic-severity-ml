@@ -90,7 +90,7 @@ def main():
     print("\n--- Generating Statistical Summary Tables ---")
 
     # Table 1: Descriptive Statistics
-    cont_features = ["tmp", "hum", "llu", "vel", "dir", "pre", "rs", "distancia_clima_km", "suma_de_vehiculos"]
+    cont_features = ["tmp", "hum", "lluvia_1h", "vel", "dir", "pre", "rs", "distancia_climatica_utilizada_km", "suma_de_vehiculos"]
     table1 = compute_descriptive_summary(df, cont_features)
     table1.to_csv(tab_dir / "table1_descriptive_statistics.csv", index=False)
     (tab_dir / "table1_descriptive_statistics.tex").write_text(
@@ -100,7 +100,7 @@ def main():
     print(f"[x] Exported Table 1: {tab_dir / 'table1_descriptive_statistics.csv'}")
 
     # Table 2: Meteorology by Severity & Kruskal-Wallis
-    clim_features = ["tmp", "hum", "llu", "lluvia_acum_3h", "lluvia_acum_6h", "vel", "pre", "rs", "temp_delta_3h"]
+    clim_features = ["tmp", "hum", "lluvia_1h", "lluvia_acum_3h", "lluvia_acum_6h", "vel", "pre", "rs", "temp_delta_3h"]
     table2 = compute_kruskal_wallis_tests(df, clim_features)
     table2.to_csv(tab_dir / "table2_meteorology_by_severity.csv", index=False)
     (tab_dir / "table2_meteorology_by_severity.tex").write_text(

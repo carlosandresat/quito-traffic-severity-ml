@@ -57,8 +57,8 @@ def assign_hierarchical_weather(
     )
 
     accidents_df = accidents_df.copy()
-    accidents_df["estacion_cercana"] = nearest_names
-    accidents_df["distancia_estacion_km"] = np.round(min_dists, 3)
+    accidents_df["estacion_geografica_mas_cercana"] = nearest_names
+    accidents_df["distancia_geografica_mas_cercana_km"] = np.round(min_dists, 3)
 
     # Rank all stations by distance for every crash
     station_names = list(REMMAQ_STATIONS.keys())
@@ -133,8 +133,8 @@ def assign_hierarchical_weather(
     for col in CLIMATE_COLUMNS:
         accidents_df[col] = matched_data[col]
 
-    accidents_df["estacion_clima_asignada"] = matched_station
-    accidents_df["distancia_clima_km"] = np.round(matched_dist, 3)
+    accidents_df["estacion_climatica_utilizada"] = matched_station
+    accidents_df["distancia_climatica_utilizada_km"] = np.round(matched_dist, 3)
     accidents_df["imputacion_clima"] = is_imputed
 
     # Impute remaining sporadic NaNs with city-wide median
@@ -143,6 +143,10 @@ def assign_hierarchical_weather(
         if accidents_df[col].isna().any():
             median_val = float(accidents_df[col].median())
             accidents_df[col] = accidents_df[col].fillna(median_val)
+
+    # Drop the raw 'llu' sentinel: it only existed to detect missing station-hours
+    # during matching above. 'lluvia_1h' (null-safe, zero-filled) is the public field.
+    accidents_df = accidents_df.drop(columns=["llu"])
 
     return accidents_df
 
@@ -225,7 +229,7 @@ def run_spatiotemporal_join(
 
     # Comprehensive quality report
     print("\n--- Spatiotemporal Matching Metrics ---")
-    dists = integrated_df["distancia_clima_km"]
+    dists = integrated_df["distancia_climatica_utilizada_km"]
     print(f"  Total integrated records   : {len(integrated_df):,}")
     print(f"  Mean station distance      : {dists.mean():.2f} km")
     print(f"  Median station distance    : {dists.median():.2f} km")
