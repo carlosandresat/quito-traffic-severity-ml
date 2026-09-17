@@ -14,7 +14,7 @@ import seaborn as sns
 import folium
 from folium.plugins import HeatMap, MarkerCluster
 
-from src.eda_statistics import compute_odds_ratio
+from src.eda_statistics import RISK_FACTORS, build_binary_risk_factors, compute_odds_ratio
 
 
 # Configure publication-grade styling
@@ -119,11 +119,12 @@ def plot_fig2_meteorological_distributions(df: pd.DataFrame, output_path: Path) 
     for idx, (col, ylabel, title) in enumerate(covariates):
         ax = axes[idx // 2, idx % 2]
         data_to_plot = [df[df["severidad"] == c][col].dropna() for c in [0, 1, 2]]
+        tick_labels = [f"{lbl}\n(n={len(d):,})" for lbl, d in zip(SEV_LABELS, data_to_plot)]
 
         bplot = ax.boxplot(
             data_to_plot,
             patch_artist=True,
-            labels=SEV_LABELS,
+            tick_labels=tick_labels,
             widths=0.5,
             showmeans=True,
             meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black", "markersize": 5},
@@ -271,33 +272,12 @@ def plot_fig4_spatial_distributions(
 
 def plot_fig5_risk_factors_forest(df: pd.DataFrame, output_path: Path) -> None:
     """Generates Figure 5: Forest plot of Odds Ratios for environmental and operational risk factors."""
-    df_temp = df.copy()
-
-    # Define binary risk flags
-    df_temp["is_raining"] = (df_temp["lluvia_1h"] > 0.1).astype(int)
-    df_temp["is_antecedent_rain"] = (df_temp["lluvia_acum_3h"] > 0.5).astype(int)
-    df_temp["is_night"] = df_temp["hora"].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
-    df_temp["is_weekend"] = df_temp["dia_semana"].isin([6, 7]).astype(int)
-    df_temp["is_holiday"] = df_temp["es_feriado"].astype(int)
-    df_temp["has_motorcycle"] = (df_temp["motocicleta"] > 0).astype(int)
-    df_temp["has_bus"] = (df_temp["bus"] > 0).astype(int)
-    df_temp["has_truck"] = (df_temp["camion"] > 0).astype(int)
-
-    factors = [
-        ("has_motorcycle", "Motorcycle Involved"),
-        ("has_bus", "Transit Bus Involved"),
-        ("has_truck", "Heavy Truck Involved"),
-        ("is_night", "Nighttime Collision (22h–05h)"),
-        ("is_weekend", "Weekend Collision (Sat–Sun)"),
-        ("is_holiday", "Public Holiday"),
-        ("is_raining", "Active Rain during Crash (>0.1 mm)"),
-        ("is_antecedent_rain", "Antecedent Rain in 3h (>0.5 mm)")
-    ]
+    df_temp = build_binary_risk_factors(df)
 
     results = []
-    for col, label in factors:
+    for col, label in RISK_FACTORS:
         res = compute_odds_ratio(df_temp, col, target_class=2)
-        res["Label"] = label
+        res["Label"] = f"{label} (n={res['N']:,})"
         results.append(res)
 
     res_df = pd.DataFrame(results)
@@ -338,17 +318,21 @@ def plot_fig5_risk_factors_forest(df: pd.DataFrame, output_path: Path) -> None:
 
 
 def plot_fig6_correlation_matrix(df: pd.DataFrame, output_path: Path) -> None:
-    """Generates Figure 6: Lower-triangle Spearman correlation matrix."""
+    """Generates Figure 6: Lower-triangle Spearman correlation matrix.
+
+    Correlations use pairwise-complete observations; the title reports the
+    smallest pairwise sample size.
+    """
     feature_cols = [
         "tmp", "hum", "vel", "pre", "rs",
         "lluvia_1h", "lluvia_acum_3h", "temp_delta_3h",
         "hora", "distancia_climatica_utilizada_km",
         "automovil", "motocicleta", "bus", "suma_de_vehiculos", "severidad"
     ]
-    sub = df[feature_cols].dropna()
-
-    corr, _ = np.corrcoef(sub.to_numpy().T), None  # compute pearson/spearman
+    sub = df[feature_cols].astype(np.float64)
     corr_df = sub.corr(method="spearman")
+    present = sub.notna().astype(np.int64)
+    min_pairwise_n = int((present.T @ present).to_numpy().min())
 
     mask = np.triu(np.ones_like(corr_df, dtype=bool))
 
@@ -372,7 +356,10 @@ def plot_fig6_correlation_matrix(df: pd.DataFrame, output_path: Path) -> None:
     clean_labels = [c.replace("_", " ").title() for c in feature_cols]
     ax.set_xticklabels(clean_labels, rotation=45, ha="right")
     ax.set_yticklabels(clean_labels, rotation=0)
-    ax.set_title("Spearman Rank Correlation Matrix among Key Covariates")
+    ax.set_title(
+        "Spearman Rank Correlation Matrix among Key Covariates\n"
+        f"(pairwise-complete observations, minimum n={min_pairwise_n:,})"
+    )
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -427,14 +414,17 @@ def generate_interactive_folium_map(
     # Fatal crashes layer (100% of fatals rendered because it is the critical minority class)
     fatal_df = df[df["severidad"] == 2]
     fatal_group = folium.FeatureGroup(name=f"Fatal Collisions (n={len(fatal_df):,})", show=True)
+    def fmt(value: Any, unit: str) -> str:
+        return "N/A" if pd.isna(value) else f"{value:.1f} {unit}"
+
     for _, row in fatal_df.iterrows():
         popup_txt = f"""
         <b>Crash ID:</b> {row.get('id_siniestro', 'N/A')}<br>
         <b>Date:</b> {row['fecha']} {row['hora_str']}<br>
         <b>Cause:</b> {row.get('causa_probable', 'N/A')[:40]}...<br>
-        <b>Nearest Station:</b> {row.get('estacion_climatica_utilizada', 'N/A')} ({row.get('distancia_climatica_utilizada_km', 0):.2f} km)<br>
-        <b>Precipitation:</b> {row.get('lluvia_1h', 0):.1f} mm/h<br>
-        <b>Temperature:</b> {row.get('tmp', 0):.1f} °C
+        <b>Weather Station:</b> {row.get('estacion_climatica_utilizada', 'N/A')} ({row.get('distancia_climatica_utilizada_km', 0):.2f} km, {row.get('asignacion_clima', 'N/A')})<br>
+        <b>Precipitation:</b> {fmt(row.get('lluvia_1h'), 'mm/h')}<br>
+        <b>Temperature:</b> {fmt(row.get('tmp'), '°C')}
         """
         folium.CircleMarker(
             location=[row["lat"], row["lon"]],

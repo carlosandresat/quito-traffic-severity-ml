@@ -18,6 +18,8 @@ if str(repo_root) not in sys.path:
 
 from config.stations_config import REMMAQ_STATIONS
 from src.eda_statistics import (
+    RISK_FACTORS,
+    build_binary_risk_factors,
     compute_descriptive_summary,
     compute_kruskal_wallis_tests,
     compute_odds_ratio,
@@ -83,6 +85,10 @@ def main():
     print(f"[x] Loading integrated research matrix: {data_path.name}")
     df = pd.read_parquet(data_path)
     print(f"    Loaded {len(df):,} accident observations across {len(df.columns)} covariates.")
+    print("    Climate assignment: " + ", ".join(
+        f"{k} {v:,}" for k, v in df["asignacion_clima"].value_counts().items()
+    ))
+    print("    Missing meteorological values are excluded per test; tables report effective N.")
 
     # -------------------------------------------------------------
     # 1. Statistical Tables Generation
@@ -110,22 +116,8 @@ def main():
     print(f"[x] Exported Table 2: {tab_dir / 'table2_meteorology_by_severity.csv'}")
 
     # Table 3: Odds Ratios for Environmental and Operational Factors
-    df_temp = df.copy()
-    df_temp["is_raining"] = (df_temp["lluvia_1h"] > 0.1).astype(int)
-    df_temp["is_antecedent_rain"] = (df_temp["lluvia_acum_3h"] > 0.5).astype(int)
-    df_temp["is_night"] = df_temp["hora"].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
-    df_temp["is_weekend"] = df_temp["dia_semana"].isin([6, 7]).astype(int)
-    df_temp["is_holiday"] = df_temp["es_feriado"].astype(int)
-    df_temp["has_motorcycle"] = (df_temp["motocicleta"] > 0).astype(int)
-    df_temp["has_bus"] = (df_temp["bus"] > 0).astype(int)
-    df_temp["has_truck"] = (df_temp["camion"] > 0).astype(int)
-
-    risk_factors = [
-        "has_motorcycle", "has_bus", "has_truck",
-        "is_night", "is_weekend", "is_holiday",
-        "is_raining", "is_antecedent_rain"
-    ]
-    or_results = [compute_odds_ratio(df_temp, rf, target_class=2) for rf in risk_factors]
+    df_temp = build_binary_risk_factors(df)
+    or_results = [compute_odds_ratio(df_temp, rf, target_class=2) for rf, _ in RISK_FACTORS]
     table3 = pd.DataFrame(or_results)
     table3.to_csv(tab_dir / "table3_odds_ratios_risk_factors.csv", index=False)
     (tab_dir / "table3_odds_ratios_risk_factors.tex").write_text(

@@ -21,7 +21,64 @@ if str(repo_root) not in sys.path:
 from config.stations_config import DMQ_BOUNDING_BOX, SEVERITY_LEVELS
 from src.ingest_ant import run_ant_ingestion
 from src.ingest_remmaq import run_remmaq_ingestion
-from src.spatiotemporal_join import run_spatiotemporal_join
+from src.spatiotemporal_join import (
+    CLIMATE_ASSIGNMENT_TYPES,
+    RAW_METEOROLOGICAL_VARIABLES,
+    run_spatiotemporal_join,
+)
+
+# Maximum share of crashes per year for which no station reported 'tmp' and 'llu'.
+# Known station outages raise the fallback share instead, so they do not count here.
+MAX_SIN_DATO_PCT_PER_YEAR: float = 5.0
+
+# Plausible annual share of crashes with measurable precipitation in the matched
+# hour, among crashes with a precipitation value. Values outside this range
+# indicate a broken meteorological alignment (e.g. zero-filled or constant rain).
+RAIN_POSITIVE_PCT_RANGE: tuple = (3.0, 30.0)
+
+
+def verify_climate_coverage(df: pd.DataFrame) -> pd.DataFrame:
+    """Asserts annual meteorological coverage of the integrated dataset.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Final integrated dataframe with 'anio', 'asignacion_clima' and 'lluvia_1h'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Annual coverage table with record counts, assignment shares (%) and the
+        share of crashes with positive precipitation (%).
+
+    Raises
+    ------
+    AssertionError
+        If any year exceeds ``MAX_SIN_DATO_PCT_PER_YEAR`` or has a positive
+        precipitation share outside ``RAIN_POSITIVE_PCT_RANGE``.
+    """
+    by_year = df.groupby("anio")
+    coverage = pd.crosstab(df["anio"], df["asignacion_clima"], normalize="index")
+    coverage = coverage.reindex(columns=CLIMATE_ASSIGNMENT_TYPES, fill_value=0.0) * 100.0
+    coverage.insert(0, "n", by_year.size())
+    coverage["lluvia_1h_disponible"] = by_year["lluvia_1h"].apply(lambda s: s.notna().mean() * 100.0)
+    coverage["lluvia_1h_positiva"] = by_year["lluvia_1h"].apply(
+        lambda s: (s.dropna() > 0).mean() * 100.0 if s.notna().any() else np.nan
+    )
+
+    excess = coverage[coverage["sin_dato"] > MAX_SIN_DATO_PCT_PER_YEAR]
+    assert excess.empty, (
+        f"Error: Years without climate data above {MAX_SIN_DATO_PCT_PER_YEAR}%:\n"
+        f"{excess.round(2).to_string()}"
+    )
+
+    low, high = RAIN_POSITIVE_PCT_RANGE
+    implausible = coverage[~coverage["lluvia_1h_positiva"].between(low, high)]
+    assert implausible.empty, (
+        f"Error: Implausible share of crashes with positive precipitation:\n"
+        f"{implausible.round(2).to_string()}"
+    )
+    return coverage
 
 
 def verify_integrated_dataset(df: pd.DataFrame) -> bool:
@@ -58,11 +115,11 @@ def verify_integrated_dataset(df: pd.DataFrame) -> bool:
     assert property_matches.all(), "Error: Inconsistency between zero-victim count and severity class 0"
     print("[x] Severity classification identity: 100% mathematical consistency with victim counts.")
 
-    # 3. Meteorological parameter bounds (physical plausibility)
-    assert (df["tmp"] >= -5.0).all() and (df["tmp"] <= 40.0).all(), "Error: Temperature out of physical bounds"
-    assert (df["hum"] >= 0.0).all() and (df["hum"] <= 100.0).all(), "Error: Relative humidity out of bounds"
-    assert (df["lluvia_1h"] >= 0.0).all(), "Error: Negative precipitation value detected"
-    print("[x] Physical meteorological bounds: All atmospheric covariates within plausible physical ranges.")
+    # 3. Meteorological parameter bounds (physical plausibility, observed values only)
+    assert df["tmp"].dropna().between(-5.0, 40.0).all(), "Error: Temperature out of physical bounds"
+    assert df["hum"].dropna().between(0.0, 100.0).all(), "Error: Relative humidity out of bounds"
+    assert (df["lluvia_1h"].dropna() >= 0.0).all(), "Error: Negative precipitation value detected"
+    print("[x] Physical meteorological bounds: All observed atmospheric covariates within plausible physical ranges.")
 
     # 4. Temporal split strict isolation
     train_years = set(df[df["split_set"] == "train"]["anio"].unique())
@@ -74,11 +131,30 @@ def verify_integrated_dataset(df: pd.DataFrame) -> bool:
     assert val_years.isdisjoint(test_years), "Error: Overlap between validation and test years"
     print(f"[x] Temporal partition isolation: Train {sorted(train_years)}, Val {sorted(val_years)}, Test {sorted(test_years)}.")
 
-    # 5. Missing value completeness check
-    critical_features = ["lat", "lon", "fecha", "hora", "severidad", "tmp", "lluvia_1h", "hum"]
+    # 5. Missing value completeness check (meteorological NaNs are preserved by design)
+    critical_features = ["lat", "lon", "fecha", "hora", "severidad"]
     null_counts = df[critical_features].isna().sum()
     assert (null_counts == 0).all(), f"Error: Unhandled null values in critical features: {null_counts}"
-    print("[x] Feature completeness: Zero missing values across critical modeling features.")
+    print("[x] Feature completeness: Zero missing values across location, time and target.")
+
+    # 6. Climate assignment labels and consistency
+    assert df["asignacion_clima"].isin(CLIMATE_ASSIGNMENT_TYPES).all(), "Error: Invalid climate assignment label"
+    assert df["n_variables_clima_faltantes"].between(0, len(RAW_METEOROLOGICAL_VARIABLES)).all(), \
+        "Error: Missing-variable counter out of range"
+    matched = df["asignacion_clima"] != "sin_dato"
+    assert df.loc[matched, ["tmp", "lluvia_1h"]].notna().all().all(), \
+        "Error: Direct or fallback assignment without temperature or precipitation"
+    direct = df["asignacion_clima"] == "directa"
+    assert (df.loc[direct, "estacion_climatica_utilizada"]
+            == df.loc[direct, "estacion_geografica_mas_cercana"]).all(), \
+        "Error: Direct assignment does not use the nearest station"
+    print("[x] Climate assignment: Labels valid and consistent with station and value availability.")
+
+    # 7. Annual climate coverage
+    coverage = verify_climate_coverage(df)
+    print(f"[x] Climate coverage: 'sin_dato' <= {MAX_SIN_DATO_PCT_PER_YEAR}% and positive rain share within "
+          f"{RAIN_POSITIVE_PCT_RANGE} % in every year (fallback reported, not asserted):")
+    print(coverage.round(2).to_string())
 
     print("=" * 70)
     print("ALL VERIFICATION CHECKS PASSED SUCCESSFULLY [x]")

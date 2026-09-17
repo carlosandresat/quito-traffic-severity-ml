@@ -29,6 +29,11 @@ CLIMATE_COLUMNS: List[str] = [
     "lluvia_1h", "lluvia_flag", "lluvia_acum_3h", "lluvia_acum_6h", "temp_delta_3h"
 ]
 
+# Directly measured variables used to count missing components of the assigned vector
+RAW_METEOROLOGICAL_VARIABLES: List[str] = ["tmp", "llu", "hum", "vel", "dir", "pre", "rs"]
+
+CLIMATE_ASSIGNMENT_TYPES: List[str] = ["directa", "fallback", "sin_dato"]
+
 
 def assign_hierarchical_weather(
     accidents_df: pd.DataFrame,
@@ -36,17 +41,30 @@ def assign_hierarchical_weather(
 ) -> pd.DataFrame:
     """Merges crash records with nearest weather station, applying spatial fallback for missing sensors.
 
+    Stations are ranked by Haversine distance and the first one reporting both
+    'tmp' and 'llu' for the crash hour supplies the meteorological vector.
+    Missing values are preserved: no imputation is performed at this stage.
+
     Parameters
     ----------
     accidents_df : pd.DataFrame
         Standardized Quito accident dataframe with 'lat', 'lon', 'fecha', 'hora'.
     weather_df : pd.DataFrame
-        Consolidated REMMAQ hourly meteorological observations.
+        Consolidated REMMAQ hourly meteorological observations with unique
+        ['estacion', 'fecha', 'hora'] keys.
 
     Returns
     -------
     pd.DataFrame
-        Accidents dataframe enriched with matched meteorological covariates and audit metrics.
+        Accidents dataframe enriched with matched meteorological covariates and
+        the audit columns:
+
+        - asignacion_clima: 'directa' if the nearest station reported 'tmp' and
+          'llu'; 'fallback' if another station did; 'sin_dato' if none did, in
+          which case the nearest station is recorded and its available values
+          (possibly none) are kept as observed.
+        - n_variables_clima_faltantes: number of missing directly measured
+          variables (0-7) in the assigned vector.
     """
     print("[x] Computing pairwise Haversine distances to all 9 REMMAQ stations...")
     accident_lats = accidents_df["lat"].to_numpy(dtype=np.float64)
@@ -70,7 +88,9 @@ def assign_hierarchical_weather(
     fe_arr = weather_df["fecha"].to_numpy()
     ho_arr = weather_df["hora"].to_numpy(dtype=np.int8)
 
-    val_arrays = [weather_df[c].to_numpy() for c in CLIMATE_COLUMNS]
+    val_arrays = [
+        weather_df[c].to_numpy(dtype=np.float64, na_value=np.nan) for c in CLIMATE_COLUMNS
+    ]
     n_weather = len(weather_df)
 
     weather_dict: Dict[Tuple[str, str, int], tuple] = {}
@@ -78,6 +98,7 @@ def assign_hierarchical_weather(
         key = (st_arr[i], fe_arr[i], ho_arr[i])
         weather_dict[key] = tuple(v[i] for v in val_arrays)
 
+    assert len(weather_dict) == n_weather, "Error: Duplicated station-hour keys in weather data"
     print(f"    Indexed {len(weather_dict):,} unique weather station-hours.")
 
     # Prepare containers for matched meteorological features
@@ -85,7 +106,7 @@ def assign_hierarchical_weather(
     matched_data = {col: np.full(n_records, np.nan, dtype=np.float32) for col in CLIMATE_COLUMNS}
     matched_station = np.empty(n_records, dtype=object)
     matched_dist = np.empty(n_records, dtype=np.float32)
-    is_imputed = np.zeros(n_records, dtype=np.int8)
+    assignment = np.empty(n_records, dtype=object)
 
     # Convert accident coordinates and keys to fast arrays
     acc_dates = accidents_df["fecha"].to_numpy()
@@ -113,11 +134,11 @@ def assign_hierarchical_weather(
                         matched_data[col][i] = row_tuple[c_idx]
                     matched_station[i] = st_candidate
                     matched_dist[i] = dist_matrix[i, s_idx]
-                    is_imputed[i] = 1 if rank_idx > 0 else 0
+                    assignment[i] = "fallback" if rank_idx > 0 else "directa"
                     found_match = True
                     break
 
-        # If no station had complete primary data, take nearest available even with partial NaNs
+        # No station reported both primary parameters: keep whatever the nearest one observed
         if not found_match:
             primary_st = station_names[ranked_indices[0]]
             primary_key = (primary_st, f, h)
@@ -127,25 +148,22 @@ def assign_hierarchical_weather(
                     matched_data[col][i] = row_tuple[c_idx]
             matched_station[i] = primary_st
             matched_dist[i] = dist_matrix[i, ranked_indices[0]]
-            is_imputed[i] = 1
+            assignment[i] = "sin_dato"
 
     # Attach matched variables to dataframe
     for col in CLIMATE_COLUMNS:
         accidents_df[col] = matched_data[col]
+    accidents_df["lluvia_flag"] = accidents_df["lluvia_flag"].astype("Int8")
 
     accidents_df["estacion_climatica_utilizada"] = matched_station
     accidents_df["distancia_climatica_utilizada_km"] = np.round(matched_dist, 3)
-    accidents_df["imputacion_clima"] = is_imputed
-
-    # Impute remaining sporadic NaNs with city-wide median
-    print("[x] Applying residual median imputation for missing values in unmonitored hours...")
-    for col in CLIMATE_COLUMNS:
-        if accidents_df[col].isna().any():
-            median_val = float(accidents_df[col].median())
-            accidents_df[col] = accidents_df[col].fillna(median_val)
+    accidents_df["asignacion_clima"] = assignment
+    accidents_df["n_variables_clima_faltantes"] = (
+        accidents_df[RAW_METEOROLOGICAL_VARIABLES].isna().sum(axis=1).astype(np.int8)
+    )
 
     # Drop the raw 'llu' sentinel: it only existed to detect missing station-hours
-    # during matching above. 'lluvia_1h' (null-safe, zero-filled) is the public field.
+    # during matching above. 'lluvia_1h' carries the same values as the public field.
     accidents_df = accidents_df.drop(columns=["llu"])
 
     return accidents_df
@@ -236,9 +254,21 @@ def run_spatiotemporal_join(
     print(f"  90th percentile distance   : {dists.quantile(0.90):.2f} km")
     print(f"  Max distance               : {dists.max():.2f} km")
 
-    impute_rate = integrated_df["imputacion_clima"].mean() * 100.0
-    print(f"  Direct primary station match: {100.0 - impute_rate:.2f}%")
-    print(f"  Spatial fallback applied    : {impute_rate:.2f}%")
+    print("\n--- Climate Assignment by Year (%) ---")
+    assignment_by_year = pd.crosstab(
+        integrated_df["anio"], integrated_df["asignacion_clima"], normalize="index"
+    ).reindex(columns=CLIMATE_ASSIGNMENT_TYPES, fill_value=0.0) * 100.0
+    assignment_by_year.loc["Total"] = (
+        integrated_df["asignacion_clima"].value_counts(normalize=True)
+        .reindex(CLIMATE_ASSIGNMENT_TYPES, fill_value=0.0) * 100.0
+    )
+    print(assignment_by_year.round(2).to_string())
+
+    print("\n--- Missing Meteorological Values in Integrated Dataset (%) ---")
+    met_cols = [c for c in CLIMATE_COLUMNS if c in integrated_df.columns]
+    print((integrated_df[met_cols].isna().mean() * 100.0).round(2).to_string())
+    print("\n  Distribution of n_variables_clima_faltantes:")
+    print(integrated_df["n_variables_clima_faltantes"].value_counts().sort_index().to_string())
 
     print("\n--- Partitions and Severity Distribution ---")
     for split_name in ["train", "val", "test"]:

@@ -12,6 +12,49 @@ import pandas as pd
 from scipy import stats
 
 
+# Binary risk factors evaluated with odds ratios: (column, display label)
+RISK_FACTORS: List[Tuple[str, str]] = [
+    ("has_motorcycle", "Motorcycle Involved"),
+    ("has_bus", "Transit Bus Involved"),
+    ("has_truck", "Heavy Truck Involved"),
+    ("is_night", "Nighttime Collision (22h–05h)"),
+    ("is_weekend", "Weekend Collision (Sat–Sun)"),
+    ("is_holiday", "Public Holiday"),
+    ("is_raining", "Active Rain during Crash (>0.1 mm)"),
+    ("is_antecedent_rain", "Antecedent Rain in 3h (>0.5 mm)")
+]
+
+
+def build_binary_risk_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """Derives the binary risk factors listed in ``RISK_FACTORS``.
+
+    Meteorological factors are nullable: a crash without a precipitation value
+    yields a missing indicator rather than being classified as dry.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Integrated analysis dataset.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the dataset with the risk factor columns appended.
+    """
+    out = df.copy()
+    out["is_raining"] = (out["lluvia_1h"] > 0.1).astype("Int8").mask(out["lluvia_1h"].isna())
+    out["is_antecedent_rain"] = (
+        (out["lluvia_acum_3h"] > 0.5).astype("Int8").mask(out["lluvia_acum_3h"].isna())
+    )
+    out["is_night"] = out["hora"].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
+    out["is_weekend"] = out["dia_semana"].isin([6, 7]).astype(int)
+    out["is_holiday"] = out["es_feriado"].astype(int)
+    out["has_motorcycle"] = (out["motocicleta"] > 0).astype(int)
+    out["has_bus"] = (out["bus"] > 0).astype(int)
+    out["has_truck"] = (out["camion"] > 0).astype(int)
+    return out
+
+
 def compute_descriptive_summary(
     df: pd.DataFrame,
     features: List[str],
@@ -31,7 +74,8 @@ def compute_descriptive_summary(
     Returns
     -------
     pd.DataFrame
-        Tabular dataframe with Mean, SD, Median, Q25, Q75 overall and per class.
+        Tabular dataframe with the effective sample size (non-missing values),
+        Mean, SD, Median and IQR overall and per class.
     """
     rows = []
     classes = sorted(df[target_col].unique())
@@ -43,6 +87,7 @@ def compute_descriptive_summary(
         series_all = df[feat].dropna()
         row_dict: Dict[str, Any] = {
             "Variable": feat,
+            "Overall_N": int(len(series_all)),
             "Overall_Mean": float(np.mean(series_all)),
             "Overall_SD": float(np.std(series_all, ddof=1)),
             "Overall_Median": float(np.median(series_all)),
@@ -51,6 +96,7 @@ def compute_descriptive_summary(
 
         for c in classes:
             series_c = df[df[target_col] == c][feat].dropna()
+            row_dict[f"Class_{c}_N"] = int(len(series_c))
             row_dict[f"Class_{c}_Mean"] = float(np.mean(series_c))
             row_dict[f"Class_{c}_SD"] = float(np.std(series_c, ddof=1))
             row_dict[f"Class_{c}_Median"] = float(np.median(series_c))
@@ -80,14 +126,14 @@ def compute_kruskal_wallis_tests(
     Returns
     -------
     pd.DataFrame
-        Results with H-statistic, p-value, effect size eta-squared, and Holm-adjusted p-values.
+        Results with effective sample size, H-statistic, p-value, effect size
+        eta-squared, and Holm-adjusted p-values. Missing values are excluded per
+        feature, and the effect size uses the effective sample size.
     """
     classes = sorted(df[target_col].unique())
     k = len(classes)
-    N = len(df)
 
     results = []
-    raw_p_values = []
 
     for feat in features:
         if feat not in df.columns:
@@ -99,13 +145,14 @@ def compute_kruskal_wallis_tests(
             continue
 
         h_stat, p_val = stats.kruskal(*samples)
-        raw_p_values.append(p_val)
+        n_effective = int(sum(len(s) for s in samples))
 
         # Effect size: eta^2 [H] = (H - k + 1) / (N - k)
-        eta_squared = max(0.0, (h_stat - k + 1.0) / (N - k))
+        eta_squared = max(0.0, (h_stat - k + 1.0) / (n_effective - k))
 
         results.append({
             "Feature": feat,
+            "N": n_effective,
             "H_Statistic": round(float(h_stat), 3),
             "p_value_raw": float(p_val),
             "Eta_Squared": round(float(eta_squared), 5),
@@ -153,7 +200,8 @@ def compute_odds_ratio(
     Returns
     -------
     Dict[str, Any]
-        Dictionary with OR, 95% CI lower/upper, z-statistic, and p-value.
+        Dictionary with effective sample size, OR, 95% CI lower/upper,
+        z-statistic, and p-value. Records with a missing factor are excluded.
     """
     sub = df[[binary_factor, target_col]].dropna()
     factor = (sub[binary_factor] > 0).astype(int)
@@ -186,6 +234,7 @@ def compute_odds_ratio(
 
     return {
         "Risk_Factor": binary_factor,
+        "N": int(len(sub)),
         "Exposed_Cases": a,
         "Exposed_Controls": b,
         "Unexposed_Cases": c,
@@ -218,7 +267,8 @@ def compute_contingency_chi2(
     Returns
     -------
     Dict[str, Any]
-        Dictionary with Chi2 statistic, degrees of freedom, p-value, and Cramér's V.
+        Dictionary with effective sample size, Chi2 statistic, degrees of
+        freedom, p-value, and Cramér's V. Records with missing values are excluded.
     """
     contingency = pd.crosstab(df[cat_col], df[target_col])
     chi2_stat, p_val, dof, _ = stats.chi2_contingency(contingency)
@@ -229,6 +279,7 @@ def compute_contingency_chi2(
 
     return {
         "Feature": cat_col,
+        "N": int(n),
         "Chi2_Statistic": round(float(chi2_stat), 3),
         "Degrees_of_Freedom": int(dof),
         "p_value": float(p_val),
