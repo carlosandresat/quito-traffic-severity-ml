@@ -36,6 +36,12 @@ FILE_VARIABLE_MAP: Dict[str, str] = {
     "RS.xlsx": "rs"     # Solar Radiation (W/m²)
 }
 
+# Maximum admissible deviation between a raw workbook timestamp and its nearest
+# full hour. Recent REMMAQ exports carry sub-second noise (at most 500 ms) from
+# Excel serial-date conversion; larger offsets would indicate a genuine
+# sub-hourly record and must not be silently snapped to the hour.
+TIMESTAMP_ROUNDING_TOLERANCE: pd.Timedelta = pd.Timedelta(seconds=30)
+
 
 def normalize_station_column(col_name: str) -> Optional[str]:
     """Maps heterogeneous column names to canonical REMMAQ station identifiers.
@@ -73,7 +79,20 @@ def read_remmaq_parameter_file(
     Returns
     -------
     pd.DataFrame
-        Long-format dataframe with columns ['fecha_hora', 'estacion', variable_name].
+        Long-format dataframe with columns ['fecha_hora', 'estacion', variable_name],
+        where 'fecha_hora' is snapped to the full hour.
+
+    Raises
+    ------
+    AssertionError
+        If any timestamp deviates from its nearest hour by more than
+        ``TIMESTAMP_ROUNDING_TOLERANCE``, or if rounding produces duplicated
+        timestamps within the workbook.
+
+    Notes
+    -----
+    Rounding is applied to the entire series rather than from a cut-off date,
+    because the onset of timestamp noise differs across parameters.
     """
     print(f"[x] Reading parameter file: {filepath.name} (variable: '{variable_name}')")
     raw = pd.read_excel(filepath, sheet_name="LIMPIO", engine="openpyxl")
@@ -81,6 +100,22 @@ def read_remmaq_parameter_file(
     # The first column is always datetime
     date_col = raw.columns[0]
     raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
+    raw = raw.dropna(subset=[date_col])
+
+    rounded = raw[date_col].dt.round("h")
+    offsets = (raw[date_col] - rounded).abs()
+    max_offset = offsets.max()
+    assert max_offset < TIMESTAMP_ROUNDING_TOLERANCE, (
+        f"Error: {filepath.name} has timestamps {max_offset} away from the full hour"
+    )
+    print(f"    Snapped {int((offsets > pd.Timedelta(0)).sum()):,} timestamps to the hour "
+          f"(max offset: {max_offset.total_seconds() * 1000:.0f} ms)")
+    raw[date_col] = rounded
+
+    n_duplicated = int(raw[date_col].duplicated().sum())
+    assert n_duplicated == 0, (
+        f"Error: {filepath.name} has {n_duplicated} duplicated hourly timestamps after rounding"
+    )
 
     # Filter to analysis horizon (including buffer for lag computations)
     filtered = raw[raw[date_col] >= start_date].copy()
@@ -106,55 +141,85 @@ def read_remmaq_parameter_file(
     )
 
     tidy[variable_name] = pd.to_numeric(tidy[variable_name], errors="coerce").astype(np.float32)
-    tidy = tidy.dropna(subset=["fecha_hora"])
     return tidy
+
+
+def reindex_to_hourly_grid(df: pd.DataFrame) -> pd.DataFrame:
+    """Expands the consolidated matrix to a continuous hourly grid per station.
+
+    Every station receives one row for each hour between the global first and
+    last timestamps; hours without any measurement are kept as NaN. This makes
+    row-based shifts and rolling windows equivalent to time-based ones.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Consolidated matrix with unique ['estacion', 'fecha_hora'] keys.
+
+    Returns
+    -------
+    pd.DataFrame
+        Matrix with exactly one row per station and hour.
+    """
+    hours = pd.date_range(df["fecha_hora"].min(), df["fecha_hora"].max(), freq="h")
+    stations = sorted(df["estacion"].unique())
+    grid = pd.MultiIndex.from_product([stations, hours], names=["estacion", "fecha_hora"])
+    return (
+        df.set_index(["estacion", "fecha_hora"])
+        .reindex(grid)
+        .reset_index()
+    )
 
 
 def compute_meteorological_lags(df: pd.DataFrame) -> pd.DataFrame:
     """Computes lagged and rolling meteorological features per monitoring station.
 
     Features computed:
-        - lluvia_1h: Instantaneous precipitation (mm/h)
-        - lluvia_flag: Boolean indicator of active precipitation (>0.1 mm/h)
-        - lluvia_acum_3h: 3-hour cumulative precipitation (road wetness proxy)
-        - lluvia_acum_6h: 6-hour cumulative precipitation
-        - temp_delta_3h: Rate of temperature change over preceding 3 hours (°C)
+        - lluvia_1h: Instantaneous precipitation (mm/h); NaN when 'llu' is missing.
+        - lluvia_flag: Nullable indicator of active precipitation (>0.1 mm/h);
+          missing when 'lluvia_1h' is missing.
+        - lluvia_acum_3h: 3-hour cumulative precipitation (road wetness proxy).
+        - lluvia_acum_6h: 6-hour cumulative precipitation.
+        - temp_delta_3h: Temperature change over the preceding 3 hours (°C).
 
     Parameters
     ----------
     df : pd.DataFrame
-        Consolidated meteorological matrix sorted by station and timestamp.
+        Consolidated meteorological matrix on a continuous hourly grid per
+        station (see ``reindex_to_hourly_grid``).
 
     Returns
     -------
     pd.DataFrame
         Dataframe enriched with lagged covariates.
+
+    Notes
+    -----
+    Rolling sums use ``min_periods=1``: the accumulated precipitation is the sum
+    of the available hours within the window, and is NaN only when every hour
+    in the window is missing. It may therefore underestimate accumulation when
+    part of the window is missing. ``temp_delta_3h`` is NaN whenever either
+    endpoint is missing.
     """
     print("[x] Computing meteorological lag features across monitoring network...")
     df = df.sort_values(by=["estacion", "fecha_hora"]).reset_index(drop=True)
 
-    # Set temporal index for rolling operations
-    results = []
-    for st_name, group in df.groupby("estacion", as_index=False):
-        grp = group.sort_values("fecha_hora").copy()
-        grp = grp.set_index("fecha_hora")
+    step = df.groupby("estacion")["fecha_hora"].diff().dropna()
+    assert (step == pd.Timedelta(hours=1)).all(), "Error: Hourly grid is not continuous"
 
-        # Instantaneous rain flag
-        grp["lluvia_1h"] = grp["llu"].fillna(0.0)
-        grp["lluvia_flag"] = (grp["lluvia_1h"] > 0.1).astype(np.int8)
-
-        # 3h and 6h rolling precipitation sums (min_periods=1 to prevent NaN propagation)
-        grp["lluvia_acum_3h"] = grp["llu"].rolling(window=3, min_periods=1).sum().astype(np.float32)
-        grp["lluvia_acum_6h"] = grp["llu"].rolling(window=6, min_periods=1).sum().astype(np.float32)
-
-        # 3h temperature rate of change (temperature at t minus temperature at t-3)
-        grp["temp_delta_3h"] = (grp["tmp"] - grp["tmp"].shift(3)).astype(np.float32)
-
-        grp = grp.reset_index()
-        results.append(grp)
-
-    enriched = pd.concat(results, ignore_index=True)
-    return enriched
+    by_station = df.groupby("estacion", sort=False)
+    df["lluvia_1h"] = df["llu"].astype(np.float32)
+    df["lluvia_flag"] = (df["lluvia_1h"] > 0.1).astype("Int8").mask(df["lluvia_1h"].isna())
+    df["lluvia_acum_3h"] = (
+        by_station["llu"].rolling(window=3, min_periods=1).sum()
+        .reset_index(level=0, drop=True).astype(np.float32)
+    )
+    df["lluvia_acum_6h"] = (
+        by_station["llu"].rolling(window=6, min_periods=1).sum()
+        .reset_index(level=0, drop=True).astype(np.float32)
+    )
+    df["temp_delta_3h"] = (df["tmp"] - by_station["tmp"].shift(3)).astype(np.float32)
+    return df
 
 
 def run_remmaq_ingestion(
@@ -202,7 +267,12 @@ def run_remmaq_ingestion(
     if consolidated is None:
         raise RuntimeError("No meteorological parameter workbooks were loaded.")
 
+    assert not consolidated.duplicated(subset=["estacion", "fecha_hora"]).any(), \
+        "Error: Duplicated station-hour keys after merging parameters"
     print(f"[x] Consolidated hourly observation matrix: {len(consolidated):,} station-hours")
+
+    consolidated = reindex_to_hourly_grid(consolidated)
+    print(f"[x] Continuous hourly grid: {len(consolidated):,} station-hours")
 
     # Add discrete temporal components for joining
     consolidated["fecha"] = consolidated["fecha_hora"].dt.strftime("%Y-%m-%d")
