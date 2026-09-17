@@ -18,3 +18,6 @@ folium>=0.15.0
 
 # Utilities and Progress Monitoring
 tqdm>=4.65.0
+
+# Testing
+pytest>=8.0.0
