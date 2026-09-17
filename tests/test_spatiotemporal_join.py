@@ -3,9 +3,10 @@
 import numpy as np
 import pandas as pd
 
-from config.stations_config import REMMAQ_STATIONS
+from config.stations_config import OROGRAPHIC_ZONES, REMMAQ_STATIONS
 from src.spatiotemporal_join import (
     REMMAQ_TIMESTAMP_OFFSET_HOURS,
+    add_orographic_metadata,
     assign_hierarchical_weather,
     weather_lookup_keys,
 )
@@ -51,3 +52,19 @@ def test_crash_is_matched_to_the_mark_of_its_own_hour():
     matched = assign_hierarchical_weather(crashes, weather)
     assert matched.loc[0, "tmp"] == 12.0
     assert matched.loc[0, "asignacion_clima"] == "directa"
+
+
+def test_orographic_metadata_describes_the_station_used():
+    crashes = pd.DataFrame({
+        "estacion_climatica_utilizada": ["Tumbaco", "Belisario"],
+        "estacion_geografica_mas_cercana": ["Belisario", "Belisario"],
+    })
+    described = add_orographic_metadata(crashes)
+    assert described["altitud_estacion_utilizada_m"].tolist() == [2348, 2818]
+    assert described["delta_altitud_estaciones_m"].tolist() == [2348 - 2818, 0]
+    assert described["zona_estacion_utilizada"].tolist() == ["valle", "meseta"]
+
+
+def test_every_station_declares_a_known_orographic_zone():
+    zones = {meta["orographic_zone"] for meta in REMMAQ_STATIONS.values()}
+    assert zones == set(OROGRAPHIC_ZONES)

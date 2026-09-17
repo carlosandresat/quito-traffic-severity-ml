@@ -18,7 +18,12 @@ repo_root = current_dir.parent
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from config.stations_config import DMQ_BOUNDING_BOX, SEVERITY_LEVELS
+from config.stations_config import (
+    DMQ_BOUNDING_BOX,
+    OROGRAPHIC_ZONES,
+    REMMAQ_STATIONS,
+    SEVERITY_LEVELS,
+)
 from src.ingest_ant import run_ant_ingestion
 from src.ingest_remmaq import run_remmaq_ingestion
 from src.spatiotemporal_join import (
@@ -202,14 +207,35 @@ def verify_integrated_dataset(df: pd.DataFrame) -> bool:
         "Error: Direct assignment does not use the nearest station"
     print("[x] Climate assignment: Labels valid and consistent with station and value availability.")
 
-    # 7. Monthly volume of georeferenced records
+    # 7. Data quality flags and orographic metadata
+    assert df["coordenada_agrupada"].dtype == bool, "Error: 'coordenada_agrupada' is not boolean"
+    assert df["hora_sintetica"].dtype == bool, "Error: 'hora_sintetica' is not boolean"
+    assert (df["coordenada_agrupada"] == df.duplicated(subset=["lat", "lon"], keep=False)).all(), \
+        "Error: Clustered coordinate flag does not match repeated coordinates"
+    altitudes = {name: meta["altitude_m"] for name, meta in REMMAQ_STATIONS.items()}
+    zones = {name: meta["orographic_zone"] for name, meta in REMMAQ_STATIONS.items()}
+    assert (df["altitud_estacion_utilizada_m"]
+            == df["estacion_climatica_utilizada"].map(altitudes)).all(), \
+        "Error: Station altitude does not match the station configuration"
+    assert (df["delta_altitud_estaciones_m"]
+            == df["altitud_estacion_utilizada_m"] - df["estacion_geografica_mas_cercana"].map(altitudes)).all(), \
+        "Error: Altitude difference is not the used minus the nearest station"
+    assert df["zona_estacion_utilizada"].isin(OROGRAPHIC_ZONES).all(), "Error: Unknown orographic zone"
+    assert (df.loc[df["asignacion_clima"] != "fallback", "delta_altitud_estaciones_m"] == 0).all(), \
+        "Error: Non-fallback assignment with an altitude difference"
+    print(f"[x] Quality flags and orography: {df['coordenada_agrupada'].mean() * 100:.2f}% clustered coordinates, "
+          f"{df['hora_sintetica'].sum():,} synthetic hours, "
+          f"{(df['zona_estacion_utilizada'] != df['estacion_geografica_mas_cercana'].map(zones)).sum():,} "
+          f"assignments crossing plateau/valley.")
+
+    # 8. Monthly volume of georeferenced records
     volume = verify_monthly_volume(df)
     exempt = volume[volume["exento"]]
     print(f"[x] Monthly volume: every month reaches {MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN:.0%} of its annual median, "
           f"except {len(exempt)} documented months:")
     print(exempt[["n", "mediana_anio", "razon"]].round(3).to_string())
 
-    # 8. Annual climate coverage
+    # 9. Annual climate coverage
     coverage = verify_climate_coverage(df)
     print(f"[x] Climate coverage: 'sin_dato' <= {MAX_SIN_DATO_PCT_PER_YEAR}% and positive rain share within "
           f"{RAIN_POSITIVE_PCT_RANGE} % in every year (fallback reported, not asserted):")

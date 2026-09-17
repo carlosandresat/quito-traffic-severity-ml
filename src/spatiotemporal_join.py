@@ -72,6 +72,42 @@ def weather_lookup_keys(
     return marks.dt.strftime("%Y-%m-%d").to_numpy(), marks.dt.hour.to_numpy(dtype=np.int8)
 
 
+def add_orographic_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    """Describes the relief of the station that supplied the meteorological vector.
+
+    A fallback assignment can cross the boundary between the central plateau and
+    the surrounding valleys, whose thermal and rainfall regimes differ. These
+    columns make that mismatch measurable instead of implicit.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Crash dataframe with 'estacion_climatica_utilizada' and
+        'estacion_geografica_mas_cercana'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe with:
+
+        - altitud_estacion_utilizada_m: altitude of the station used (m).
+        - delta_altitud_estaciones_m: altitude of the station used minus that of
+          the geographically nearest one; zero under direct assignment.
+        - zona_estacion_utilizada: orographic zone of the station used
+          ('meseta' or 'valle'), as declared in ``config.stations_config``.
+    """
+    df = df.copy()
+    altitudes = {name: meta["altitude_m"] for name, meta in REMMAQ_STATIONS.items()}
+    zones = {name: meta["orographic_zone"] for name, meta in REMMAQ_STATIONS.items()}
+
+    used_altitude = df["estacion_climatica_utilizada"].map(altitudes)
+    nearest_altitude = df["estacion_geografica_mas_cercana"].map(altitudes)
+    df["altitud_estacion_utilizada_m"] = used_altitude.astype(np.int16)
+    df["delta_altitud_estaciones_m"] = (used_altitude - nearest_altitude).astype(np.int16)
+    df["zona_estacion_utilizada"] = df["estacion_climatica_utilizada"].map(zones)
+    return df
+
+
 def assign_hierarchical_weather(
     accidents_df: pd.DataFrame,
     weather_df: pd.DataFrame
@@ -194,6 +230,7 @@ def assign_hierarchical_weather(
     accidents_df["estacion_climatica_utilizada"] = matched_station
     accidents_df["distancia_climatica_utilizada_km"] = np.round(matched_dist, 3)
     accidents_df["asignacion_clima"] = assignment
+    accidents_df = add_orographic_metadata(accidents_df)
     accidents_df["n_variables_clima_faltantes"] = (
         accidents_df[RAW_METEOROLOGICAL_VARIABLES].isna().sum(axis=1).astype(np.int8)
     )
@@ -305,6 +342,15 @@ def run_spatiotemporal_join(
     print((integrated_df[met_cols].isna().mean() * 100.0).round(2).to_string())
     print("\n  Distribution of n_variables_clima_faltantes:")
     print(integrated_df["n_variables_clima_faltantes"].value_counts().sort_index().to_string())
+
+    print("\n--- Orographic Mismatch of the Assigned Station ---")
+    crossing = integrated_df["zona_estacion_utilizada"] != integrated_df["estacion_geografica_mas_cercana"].map(
+        {name: meta["orographic_zone"] for name, meta in REMMAQ_STATIONS.items()}
+    )
+    print(f"  Assignments crossing plateau/valley : {int(crossing.sum()):,} "
+          f"({crossing.mean() * 100:.2f}%)")
+    print(f"  Altitude difference (m)             : mean {integrated_df['delta_altitud_estaciones_m'].mean():.1f}, "
+          f"min {integrated_df['delta_altitud_estaciones_m'].min()}, max {integrated_df['delta_altitud_estaciones_m'].max()}")
 
     print("\n--- Partitions and Severity Distribution ---")
     for split_name in ["train", "val", "test"]:

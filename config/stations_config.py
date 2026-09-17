@@ -4,6 +4,20 @@ This module provides metadata, geodetic coordinates (WGS84 datum),
 and station alias mappings for the Red Metropolitana de Monitoreo
 Atmosférico de Quito (REMMAQ), alongside geographic bounding boxes
 for the Metropolitan District of Quito (DMQ).
+
+Each station also declares an orographic zone, used to audit how far a crash
+location and the station that supplied its weather differ in altitude and relief.
+Two zones are distinguished:
+
+- 'meseta': the central plateau where the compact city sits, on the eastern slope
+  of the Pichincha volcano, between roughly 2,660 and 3,060 m.
+- 'valle': the inter-Andean valleys that surround it, 300 to 500 m below the
+  plateau and separated from it by a ridge, with a warmer and drier regime.
+
+San Antonio (2,442 m) is classified as 'valle': although it lies north of the
+plateau rather than east of it, it belongs to the dry Guayllabamba basin and is
+separated from Quito by the Pomasqui pass, so its regime follows the valleys and
+not the plateau. Altitudes are those published by the Secretaría de Ambiente.
 """
 
 from typing import Dict, Any, List
@@ -16,6 +30,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.4900,
         "altitude_m": 2818,
         "zone": "Centro-Norte",
+        "orographic_zone": "meseta",
         "description": "Estación Belisario Quevedo / UTE"
     },
     "Carapungo": {
@@ -23,6 +38,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.4439,
         "altitude_m": 2660,
         "zone": "Norte",
+        "orographic_zone": "meseta",
         "description": "Estación Carapungo"
     },
     "Centro": {
@@ -30,6 +46,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.5144,
         "altitude_m": 2820,
         "zone": "Centro Histórico",
+        "orographic_zone": "meseta",
         "description": "Estación Centro Histórico"
     },
     "Cotocollao": {
@@ -37,6 +54,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.4981,
         "altitude_m": 2739,
         "zone": "Noroccidente",
+        "orographic_zone": "meseta",
         "description": "Estación Cotocollao"
     },
     "ElCamal": {
@@ -44,6 +62,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.5192,
         "altitude_m": 2840,
         "zone": "Sur",
+        "orographic_zone": "meseta",
         "description": "Estación El Camal"
     },
     "Guamani": {
@@ -51,6 +70,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.5503,
         "altitude_m": 3056,
         "zone": "Sur Extremo",
+        "orographic_zone": "meseta",
         "description": "Estación Guamaní"
     },
     "LosChillos": {
@@ -58,6 +78,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.4553,
         "altitude_m": 2453,
         "zone": "Valle de Los Chillos",
+        "orographic_zone": "valle",
         "description": "Estación Valle de Los Chillos"
     },
     "SanAntonio": {
@@ -65,6 +86,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.4450,
         "altitude_m": 2442,
         "zone": "Nororiente",
+        "orographic_zone": "valle",
         "description": "Estación San Antonio de Pichincha"
     },
     "Tumbaco": {
@@ -72,6 +94,7 @@ REMMAQ_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -78.4031,
         "altitude_m": 2348,
         "zone": "Valle de Tumbaco",
+        "orographic_zone": "valle",
         "description": "Estación Valle de Tumbaco"
     }
 }
@@ -112,6 +135,9 @@ METEOROLOGICAL_PARAMETERS: List[str] = [
     "PRE",  # Atmospheric Surface Pressure (hPa)
     "RS"    # Solar Radiation (W/m²)
 ]
+
+# Orographic zones declared by the stations above
+OROGRAPHIC_ZONES: List[str] = ["meseta", "valle"]
 
 # Standard severity mapping
 SEVERITY_LEVELS: Dict[int, str] = {
