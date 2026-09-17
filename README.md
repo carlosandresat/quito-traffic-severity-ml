@@ -10,12 +10,14 @@ A reproducible, data integration pipeline combining geolocated traffic accident 
 
 ## 1. Overview and Scientific Motivation
 
-Predicting the severity of road traffic collisions conditioned on instantaneous and antecedent meteorological factors is critical for proactive urban road safety management. While prior research in Ecuador predominantly relied on aggregated cantonal statistics without geodetic references, this repository implements a fine-grained spatiotemporal matching engine connecting **43,255 geolocated crash events (2017–2026)** to the nearest official atmospheric monitoring stations using orthodromic Haversine distances.
+Predicting the severity of road traffic collisions conditioned on instantaneous and antecedent meteorological factors is critical for proactive urban road safety management. While prior research in Ecuador predominantly relied on aggregated cantonal statistics without geodetic references, this repository implements a fine-grained spatiotemporal matching engine connecting **43,234 geolocated crash events (2017–2026)** to the nearest official atmospheric monitoring stations using orthodromic Haversine distances.
 
 ### Key Highlights
-- **Geographic Precision:** 100% of analyzed crashes contain verified WGS84 coordinates bounded within the DMQ spatial domain (mean station distance: $3.20\text{ km}$, median: $2.73\text{ km}$).
+- **Geographic Precision:** 100% of analyzed crashes carry verified WGS84 coordinates inside the DMQ spatial domain (mean distance to the station that supplied the weather: $3.25\text{ km}$, median: $2.76\text{ km}$, 90th percentile: $5.42\text{ km}$).
 - **Validated Atmospheric Series:** Meteorological variables are sourced strictly from QA/QC-controlled observations validated under WHO, US-EPA, and WMO-GAW protocols.
 - **Hydrological Lag Covariates:** Incorporates rolling precipitation accumulations ($3\text{h}$ and $6\text{h}$) and thermal gradient indicators ($\Delta T_{3\text{h}}$) as physical proxies for surface friction and cold front passages.
+- **Observed Values Only:** Missing meteorological readings are preserved as missing. No imputation is performed in the data layer, and every crash declares how its weather was assigned (`asignacion_clima`) and how many variables are absent (`n_variables_clima_faltantes`).
+- **Documented Source Defects:** Timestamp drift, a change of hourly convention and overwritten coordinates in the sources are corrected explicitly and guarded by assertions (Section 8).
 - **Strict Temporal Partitioning:** Implements out-of-time evaluation partitions (Train: 2017–2024, Validation: 2025, Test: 2026) to guarantee zero data leakage.
 
 ---
@@ -33,10 +35,12 @@ $$\text{SEVERIDAD} = \begin{cases}
 ### Empirical Class Distribution (DMQ, 2017–2026)
 | Class | Category | Observations | Proportion |
 |---|---|---|---|
-| **0** | Property Damage Only | 22,806 | 52.72% |
-| **1** | Non-Fatal Injuries | 18,071 | 41.78% |
-| **2** | Fatal Crash | 2,378 | 5.50% |
-| **Total** | **Unified Sample** | **43,255** | **100.00%** |
+| **0** | Property Damage Only | 22,794 | 52.72% |
+| **1** | Non-Fatal Injuries | 18,063 | 41.78% |
+| **2** | Fatal Crash | 2,377 | 5.50% |
+| **Total** | **Unified Sample** | **43,234** | **100.00%** |
+
+Partitions: `train` 2017–2024 (36,891 crashes, 5.12% fatal), `val` 2025 (3,987, 7.90%) and `test` January–July 2026 (2,356, 7.39%). The fatal share is not stable across the study period; see Section 8.
 
 ---
 
@@ -63,14 +67,21 @@ quito-traffic-severity-ml/
 ├── requirements.txt                # Reproducible dependency specifications
 ├── config/
 │   ├── __init__.py
-│   └── stations_config.py          # REMMAQ station coordinates, aliases, and spatial bounds
+│   ├── stations_config.py          # REMMAQ coordinates, altitudes, orographic zones, aliases, spatial bounds
+│   └── category_mappings.py        # Canonical ANT crash types, cause texts and parish names
 ├── src/
 │   ├── __init__.py
 │   ├── utils.py                    # Vectorized Haversine metric and geodetic validation
-│   ├── ingest_ant.py               # ANT crash homogenization and filtering pipeline
-│   ├── ingest_remmaq.py            # REMMAQ hourly meteorological consolidation and lag engineering
-│   ├── spatiotemporal_join.py      # Spatial nearest-station matcher and hierarchical fallback
+│   ├── ingest_ant.py               # ANT crash homogenization, source-defect rules and quality flags
+│   ├── ingest_remmaq.py            # REMMAQ hourly consolidation, hour convention and lag engineering
+│   ├── spatiotemporal_join.py      # Nearest-station matcher, hierarchical fallback and orographic metadata
+│   ├── eda_statistics.py           # Hypothesis tests, odds ratios and LaTeX table export
+│   ├── eda_plots.py                # Publication figures and interactive map
+│   ├── run_eda.py                  # EDA orchestrator
 │   └── run_pipeline.py             # End-to-end pipeline orchestrator and validation suite
+├── tests/                          # pytest suite (see Section 7)
+├── notebooks/                      # Exploratory analysis notebook
+├── reports/                        # Figures (300 dpi), tables (.csv and .tex) and interactive map
 └── data/                           # Ignored by Git (data privacy policy)
     ├── raw/                        # Raw source datasets (local copies)
     │   ├── transito/ANT/           # ANT crash datasets (CSV 2017–2023, XLSX 2024, 2025, 2026)
@@ -89,7 +100,7 @@ quito-traffic-severity-ml/
 ### 5.2 Environment Setup
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/quito-traffic-severity-ml.git
+git clone https://github.com/carlosandresat/quito-traffic-severity-ml.git
 cd quito-traffic-severity-ml
 
 # Create and activate virtual environment
@@ -111,13 +122,67 @@ python src/run_pipeline.py
 ```
 
 ### Pipeline Execution Flow
-1. **`ingest_ant.py`:** Ingests CSV (2017–2023) and cumulative annual XLSX (2024, 2025, 2026), standardizes schema, filters DMQ bounding box, and saves `ant_accidents_quito_unified.parquet`.
-2. **`ingest_remmaq.py`:** Reads QA/QC-validated parameters, reshapes into long format, aligns multi-year hourly series, computes rolling lag variables, and saves `remmaq_meteorology_hourly.parquet`.
-3. **`spatiotemporal_join.py`:** Assigns nearest REMMAQ monitoring station using Haversine distance, applies hierarchical spatial fallback for sensor outages, assigns temporal splits, and exports `integrated_traffic_weather_quito.parquet`.
-4. **`verify_integrated_dataset`:** Executes automated unit tests asserting mathematical consistency, coordinate bounds, and partition isolation.
+1. **`ingest_ant.py`:** Ingests CSV (2017–2023) and cumulative annual XLSX (2024, 2025, 2026), voids the December 2024 coordinates copied from January 2024, standardizes the schema, filters the DMQ bounding box, harmonizes categorical taxonomies, flags clustered geocoding and synthetic hours, and saves `ant_accidents_quito_unified.parquet`.
+2. **`ingest_remmaq.py`:** Reads QA/QC-validated parameters, snaps drifting timestamps to the hour, harmonizes the hourly convention, reshapes into long format on a continuous hourly grid per station, computes rolling lag variables, and saves `remmaq_meteorology_hourly.parquet` (755,784 station-hours, 2017-01-01 to 2026-07-31).
+3. **`spatiotemporal_join.py`:** Assigns the nearest REMMAQ station by Haversine distance, applies hierarchical spatial fallback for sensor outages without imputing missing readings, records the altitude and orographic zone of the station used, assigns temporal splits, and exports `integrated_traffic_weather_quito.parquet`.
+4. **`verify_integrated_dataset`:** Asserts geodetic containment, the severity identity, physical bounds of observed readings, partition isolation, climate assignment consistency, the quality and orographic columns, monthly record volume and annual climate coverage.
+
+Regenerate the figures and tables of `reports/` with:
+
+```bash
+python src/run_eda.py
+```
+
+### Integrated Dataset Schema
+
+`integrated_traffic_weather_quito.parquet` holds 43,234 crashes and 58 columns: crash identification and time, location and administrative context, harmonized crash typology and probable cause, victim counts and the severity target, vehicle counts by type, the meteorological vector with its lag features, and the audit columns below.
+
+| Column | Meaning |
+|---|---|
+| `asignacion_clima` | `directa` when the geographically nearest station reported both temperature and precipitation for that hour (89.24% of crashes), `fallback` when another station did (10.74%), `sin_dato` when none did (0.01%). |
+| `n_variables_clima_faltantes` | Number of the seven measured variables missing from the assigned vector (0–7). |
+| `estacion_geografica_mas_cercana`, `distancia_geografica_mas_cercana_km` | Nearest station and its distance, always. |
+| `estacion_climatica_utilizada`, `distancia_climatica_utilizada_km` | Station that supplied the vector and its distance. |
+| `altitud_estacion_utilizada_m`, `delta_altitud_estaciones_m`, `zona_estacion_utilizada` | Altitude of the station used, its difference with the nearest one, and its orographic zone (`meseta` or `valle`). |
+| `coordenada_agrupada` | The exact coordinate pair is shared with another crash: centroid geocoding rather than the crash site. |
+| `hora_sintetica` | The source hour was unreadable and the parser default was used. |
+| `split_set` | Temporal partition. Never a feature. |
+
+Meteorological columns may be missing and are left as such. Any imputation belongs to the modeling pipeline and must be fitted on the training fold alone. `lesionados`, `fallecidos`, `id_siniestro`, `direccion`, `hora_str`, `dia_nombre`, `fecha`, `anio` and `split_set` are not features; `tipo_siniestro`, `causa_probable` and `no_identificado` are recorded after the outcome and require ablation.
 
 ---
 
-## 7. Data Privacy and Git Policy
+## 7. Automated Tests
+
+```bash
+python -m pytest tests -q
+```
+
+The suite combines synthetic tests, which run without data, and integrity tests over the processed Parquet files, which are skipped when those files are absent (they are not versioned).
+
+| File | Scope |
+|---|---|
+| `tests/test_ant_ingestion.py` | Coordinate invalidation rule, cross-month coordinate copies, categorical harmonization, synthetic-hour and clustered-coordinate flags. |
+| `tests/test_remmaq_hourly.py` | Timestamp drift tolerance, hourly convention, grid continuity, uniqueness, lag recomputation on a time basis, and the solar-radiation signature of the hour-beginning convention in every year. |
+| `tests/test_spatiotemporal_join.py` | Lookup keys and hourly offset, matching a crash to the mark of its own hour, orographic metadata. |
+| `tests/test_integrated_dataset.py` | Schema contract, canonical taxonomies, severity identity, partitions, climate coverage thresholds, monthly volume, absence of imputed value mass. |
+
+---
+
+## 8. Known Source Limitations
+
+These defects belong to the published sources, not to the pipeline. Each one is corrected explicitly and guarded by an assertion, so a regression stops the run instead of propagating silently.
+
+- **REMMAQ timestamp drift.** Recent exports build each timestamp by adding an inexact hourly increment to the previous one (about 3600.005 s), so the deviation from the full hour accumulates, reaching 29.2 s by July 2026. Timestamps are snapped to the hour, subject to two checks: the absolute offset stays well below half an hour, and consecutive records are separated by whole hours up to a small jitter. Genuinely sub-hourly records are rejected.
+- **Undocumented and non-constant hourly convention.** The provider does not state whether a mark denotes the hour that begins or the hour that ends. The diurnal cycle of solar radiation, corroborated by temperature, humidity, wind, pressure and precipitation, shows that marks before 2019-06-18 summarize the preceding hour, while later marks summarize the following one. Earlier marks are relabelled one hour back, so the series follows a single hour-beginning convention; the hour lost by the source at the change remains missing. This is an empirical inference, not a statement by the provider.
+- **December 2024 coordinates.** In the 2024 workbook, the December block of the municipal agencies carries the coordinates of the first 827 January records; the originals are not available in any published source. Those coordinates are voided before the spatial filter, so December 2024 keeps only the 14 national police records and must be treated as a month without valid georeferencing, like October to December 2023.
+- **Station outages.** Centro was not operating in 2017–2018, El Camal reports almost nothing in 2023–2024 and again in June–July 2026, and Guamaní falls to 46% in 2025 and 0% in 2026. Outages raise the share of fallback assignments rather than leaving crashes without weather, and the altitude difference of each assignment is recorded.
+- **Source-period taxonomies.** The 2017–2023 CSV writes categories without accents and with the digraph 'NI' for 'Ñ'. Explicit lookup tables map every observed value to the spelling published in the 2024–2026 workbooks.
+- **Centroid geocoding.** 40.6% of crashes share an exact coordinate with another crash, a by-product of geocoding to administrative centroids that collapses after April 2022 and is more frequent among non-fatal crashes. Raw coordinates are therefore not suitable as model features; `coordenada_agrupada` supports stratified sensitivity analyses.
+- **Reporting regime.** Recorded non-fatal crashes fall abruptly in January 2019, with a second step in March 2020, while fatal crashes do not fall. The cause is not documented publicly. The fatal share rises from 2.74% (2017) to about 7.9% from 2022 onwards, so the class prior is not comparable across the whole period.
+
+---
+
+## 9. Data Privacy and Git Policy
 
 In accordance with institutional data sharing policies and repository best practices, all raw datasets and generated data matrices are strictly excluded from version control via `.gitignore`. The code provided here guarantees deterministic, bitwise reproducibility given the input datasets.
