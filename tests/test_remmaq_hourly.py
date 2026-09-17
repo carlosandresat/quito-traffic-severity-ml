@@ -8,12 +8,19 @@ import pandas as pd
 import pytest
 
 from src.ingest_remmaq import (
+    REMMAQ_HOUR_ENDING_UNTIL,
     compute_meteorological_lags,
     read_remmaq_parameter_file,
     reindex_to_hourly_grid,
 )
 
 LAG_WARMUP_HOURS = 6
+
+# Solar indicators of the hour-beginning convention in Quito (sunrise ~06:15,
+# sunset ~18:15): radiation is usually positive at mark 06:00 and absent at mark
+# 18:00, and the daily radiation centroid precedes solar noon (~12:14).
+SUNLIT_SHARE_THRESHOLD = 0.5
+MAX_RADIATION_CENTROID_HOUR = 12.0
 
 
 def _read_synthetic_workbook(timestamps: pd.Series) -> pd.DataFrame:
@@ -50,6 +57,16 @@ def test_duplicated_hour_after_rounding_is_rejected():
     hours = pd.concat([hours, pd.Series([hours.iloc[4] + pd.Timedelta(milliseconds=30)])])
     with pytest.raises(AssertionError, match="duplicated hourly timestamps"):
         _read_synthetic_workbook(hours)
+
+
+def test_hour_ending_marks_are_relabelled_to_hour_beginning():
+    hours = pd.Series(pd.date_range(REMMAQ_HOUR_ENDING_UNTIL - pd.Timedelta(hours=3), periods=6, freq="h"))
+    tidy = _read_synthetic_workbook(hours)
+    expected = pd.DatetimeIndex(list(hours.iloc[:3] - pd.Timedelta(hours=1)) + list(hours.iloc[3:]))
+    assert (tidy["fecha_hora"].to_numpy() == expected.to_numpy()).all()
+    grid = reindex_to_hourly_grid(tidy)
+    gap = grid.loc[grid["fecha_hora"] == REMMAQ_HOUR_ENDING_UNTIL - pd.Timedelta(hours=1), "tmp"]
+    assert len(grid) == 7 and gap.isna().all()
 
 
 def test_lags_respect_missing_hours():
@@ -106,6 +123,20 @@ def test_every_year_has_joint_temperature_and_precipitation(remmaq_df):
     joint = remmaq_df["tmp"].notna() & remmaq_df["llu"].notna()
     coverage = joint.groupby(remmaq_df["fecha_hora"].dt.year).mean()
     assert (coverage > 0.5).all(), coverage
+
+
+def test_solar_radiation_follows_hour_beginning_convention_every_year(remmaq_df):
+    radiation = remmaq_df.loc[remmaq_df["rs"].notna(), ["fecha_hora", "rs"]]
+    hour = radiation["fecha_hora"].dt.hour
+    for year, rows in radiation.groupby(radiation["fecha_hora"].dt.year):
+        h = hour[rows.index]
+        sunlit_06 = (rows.loc[h == 6, "rs"] > 5).mean()
+        sunlit_18 = (rows.loc[h == 18, "rs"] > 5).mean()
+        cycle = rows.groupby(h)["rs"].mean()
+        centroid = (cycle.index * cycle).sum() / cycle.sum()
+        assert sunlit_06 > SUNLIT_SHARE_THRESHOLD, f"{year}: {sunlit_06:.1%} sunlit at mark 06"
+        assert sunlit_18 < SUNLIT_SHARE_THRESHOLD, f"{year}: {sunlit_18:.1%} sunlit at mark 18"
+        assert centroid < MAX_RADIATION_CENTROID_HOUR, f"{year}: radiation centroid at {centroid:.2f} h"
 
 
 def test_lags_match_time_based_recomputation(remmaq_df):

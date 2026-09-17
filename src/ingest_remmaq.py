@@ -45,6 +45,17 @@ FILE_VARIABLE_MAP: Dict[str, str] = {
 TIMESTAMP_ROUNDING_TOLERANCE: pd.Timedelta = pd.Timedelta(minutes=5)
 TIMESTAMP_STEP_TOLERANCE: pd.Timedelta = pd.Timedelta(seconds=1)
 
+# The source does not document its hourly convention. The diurnal cycle of solar
+# radiation shows that marks before this instant follow the hour-ending
+# convention (mark HH:00 summarizes HH-1:00 to HH:00: radiation is zero at the
+# 06:00 mark and positive at the 18:00 mark), whereas later marks follow the
+# hour-beginning convention (mark HH:00 summarizes HH:00 to HH+1:00). The change
+# occurs in all nine stations and all seven parameters between 2019-06-17 19:00
+# and 2019-06-18 05:00 (auditorias/F_implementacion.md). Earlier marks are
+# relabelled one hour back so that the whole series follows the hour-beginning
+# convention; the hour lost at the change of convention remains missing.
+REMMAQ_HOUR_ENDING_UNTIL: pd.Timestamp = pd.Timestamp("2019-06-18 00:00:00")
+
 
 def normalize_station_column(col_name: str) -> Optional[str]:
     """Maps heterogeneous column names to canonical REMMAQ station identifiers.
@@ -61,6 +72,24 @@ def normalize_station_column(col_name: str) -> Optional[str]:
     """
     clean = str(col_name).strip().lower()
     return STATION_ALIASES.get(clean, None)
+
+
+def to_hour_beginning_convention(timestamps: pd.Series) -> pd.Series:
+    """Relabels hour-ending REMMAQ marks to the start of the hour they summarize.
+
+    Parameters
+    ----------
+    timestamps : pd.Series
+        Hourly timestamps already snapped to the full hour.
+
+    Returns
+    -------
+    pd.Series
+        Timestamps where marks earlier than ``REMMAQ_HOUR_ENDING_UNTIL`` are moved
+        one hour back; later marks are unchanged.
+    """
+    hour_ending = timestamps < REMMAQ_HOUR_ENDING_UNTIL
+    return timestamps.where(~hour_ending, timestamps - pd.Timedelta(hours=1))
 
 
 def read_remmaq_parameter_file(
@@ -83,7 +112,8 @@ def read_remmaq_parameter_file(
     -------
     pd.DataFrame
         Long-format dataframe with columns ['fecha_hora', 'estacion', variable_name],
-        where 'fecha_hora' is snapped to the full hour.
+        where 'fecha_hora' is snapped to the full hour and marks the beginning of
+        the hour summarized by each value.
 
     Raises
     ------
@@ -97,7 +127,8 @@ def read_remmaq_parameter_file(
     Notes
     -----
     Rounding is applied to the entire series rather than from a cut-off date,
-    because the onset of timestamp noise differs across parameters.
+    because the onset of timestamp noise differs across parameters. The hourly
+    convention is harmonized after rounding (see ``REMMAQ_HOUR_ENDING_UNTIL``).
     """
     print(f"[x] Reading parameter file: {filepath.name} (variable: '{variable_name}')")
     raw = pd.read_excel(filepath, sheet_name="LIMPIO", engine="openpyxl")
@@ -120,7 +151,7 @@ def read_remmaq_parameter_file(
     print(f"    Snapped {int((offsets > pd.Timedelta(0)).sum()):,} timestamps to the hour "
           f"(max offset: {max_offset.total_seconds() * 1000:.0f} ms, "
           f"max step jitter: {step_jitter.total_seconds() * 1000:.0f} ms)")
-    raw[date_col] = rounded
+    raw[date_col] = to_hour_beginning_convention(rounded)
 
     n_duplicated = int(raw[date_col].duplicated().sum())
     assert n_duplicated == 0, (
