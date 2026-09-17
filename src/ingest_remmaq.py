@@ -36,11 +36,14 @@ FILE_VARIABLE_MAP: Dict[str, str] = {
     "RS.xlsx": "rs"     # Solar Radiation (W/m²)
 }
 
-# Maximum admissible deviation between a raw workbook timestamp and its nearest
-# full hour. Recent REMMAQ exports carry sub-second noise (at most 500 ms) from
-# Excel serial-date conversion; larger offsets would indicate a genuine
-# sub-hourly record and must not be silently snapped to the hour.
-TIMESTAMP_ROUNDING_TOLERANCE: pd.Timedelta = pd.Timedelta(seconds=30)
+# Recent REMMAQ exports generate each timestamp by adding a slightly inexact
+# hourly increment to the previous one (about 3600.005 s), so the deviation
+# from the full hour accumulates over consecutive records (29.2 s by July
+# 2026) instead of staying bounded. Two checks separate this drift from genuine
+# sub-hourly records: the absolute offset must stay well below half an hour,
+# and consecutive records must be separated by whole hours up to a small jitter.
+TIMESTAMP_ROUNDING_TOLERANCE: pd.Timedelta = pd.Timedelta(minutes=5)
+TIMESTAMP_STEP_TOLERANCE: pd.Timedelta = pd.Timedelta(seconds=1)
 
 
 def normalize_station_column(col_name: str) -> Optional[str]:
@@ -86,7 +89,9 @@ def read_remmaq_parameter_file(
     ------
     AssertionError
         If any timestamp deviates from its nearest hour by more than
-        ``TIMESTAMP_ROUNDING_TOLERANCE``, or if rounding produces duplicated
+        ``TIMESTAMP_ROUNDING_TOLERANCE``, if the interval between consecutive
+        records differs from a whole number of hours by more than
+        ``TIMESTAMP_STEP_TOLERANCE``, or if rounding produces duplicated
         timestamps within the workbook.
 
     Notes
@@ -100,7 +105,7 @@ def read_remmaq_parameter_file(
     # The first column is always datetime
     date_col = raw.columns[0]
     raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
-    raw = raw.dropna(subset=[date_col])
+    raw = raw.dropna(subset=[date_col]).sort_values(date_col)
 
     rounded = raw[date_col].dt.round("h")
     offsets = (raw[date_col] - rounded).abs()
@@ -108,8 +113,13 @@ def read_remmaq_parameter_file(
     assert max_offset < TIMESTAMP_ROUNDING_TOLERANCE, (
         f"Error: {filepath.name} has timestamps {max_offset} away from the full hour"
     )
+    step_jitter = (raw[date_col].diff() - rounded.diff()).abs().max()
+    assert step_jitter < TIMESTAMP_STEP_TOLERANCE, (
+        f"Error: {filepath.name} has consecutive records {step_jitter} off a whole-hour step"
+    )
     print(f"    Snapped {int((offsets > pd.Timedelta(0)).sum()):,} timestamps to the hour "
-          f"(max offset: {max_offset.total_seconds() * 1000:.0f} ms)")
+          f"(max offset: {max_offset.total_seconds() * 1000:.0f} ms, "
+          f"max step jitter: {step_jitter.total_seconds() * 1000:.0f} ms)")
     raw[date_col] = rounded
 
     n_duplicated = int(raw[date_col].duplicated().sum())
