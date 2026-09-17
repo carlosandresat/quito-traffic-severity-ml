@@ -34,6 +34,43 @@ RAW_METEOROLOGICAL_VARIABLES: List[str] = ["tmp", "llu", "hum", "vel", "dir", "p
 
 CLIMATE_ASSIGNMENT_TYPES: List[str] = ["directa", "fallback", "sin_dato"]
 
+# Hours added to the crash hour to obtain the REMMAQ mark that is matched. The
+# hourly matrix follows the hour-beginning convention (mark HH:00 summarizes
+# HH:00 to HH+1:00; see ``src.ingest_remmaq.REMMAQ_HOUR_ENDING_UNTIL``), inferred
+# empirically from the diurnal cycle of solar radiation because the source does
+# not document it (auditorias/B_addendum_convencion_horaria.md). A crash at HH:mm
+# therefore falls within the hour summarized by mark HH:00, and no offset applies.
+REMMAQ_TIMESTAMP_OFFSET_HOURS: int = 0
+
+
+def weather_lookup_keys(
+    dates: pd.Series,
+    hours: pd.Series,
+    offset_hours: int = REMMAQ_TIMESTAMP_OFFSET_HOURS
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Builds the REMMAQ (date, hour) key matched to each crash.
+
+    Parameters
+    ----------
+    dates : pd.Series
+        Crash dates as ISO strings (YYYY-MM-DD).
+    hours : pd.Series
+        Crash hours (0-23).
+    offset_hours : int
+        Hours added to the crash hour before lookup; date rollovers are handled.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        - Lookup dates as ISO strings.
+        - Lookup hours as integers (0-23).
+    """
+    marks = (
+        pd.to_datetime(dates, format="%Y-%m-%d")
+        + pd.to_timedelta(hours.astype(np.int64) + offset_hours, unit="h")
+    )
+    return marks.dt.strftime("%Y-%m-%d").to_numpy(), marks.dt.hour.to_numpy(dtype=np.int8)
+
 
 def assign_hierarchical_weather(
     accidents_df: pd.DataFrame,
@@ -42,7 +79,8 @@ def assign_hierarchical_weather(
     """Merges crash records with nearest weather station, applying spatial fallback for missing sensors.
 
     Stations are ranked by Haversine distance and the first one reporting both
-    'tmp' and 'llu' for the crash hour supplies the meteorological vector.
+    'tmp' and 'llu' for the crash hour supplies the meteorological vector. The
+    crash hour is mapped to a REMMAQ mark with ``weather_lookup_keys``.
     Missing values are preserved: no imputation is performed at this stage.
 
     Parameters
@@ -108,9 +146,7 @@ def assign_hierarchical_weather(
     matched_dist = np.empty(n_records, dtype=np.float32)
     assignment = np.empty(n_records, dtype=object)
 
-    # Convert accident coordinates and keys to fast arrays
-    acc_dates = accidents_df["fecha"].to_numpy()
-    acc_hours = accidents_df["hora"].to_numpy(dtype=np.int8)
+    acc_dates, acc_hours = weather_lookup_keys(accidents_df["fecha"], accidents_df["hora"])
 
     print("[x] Performing O(1) spatiotemporal matching with hierarchical spatial fallback...")
     for i in range(n_records):
