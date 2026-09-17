@@ -5,10 +5,14 @@ import pandas as pd
 import pytest
 
 from config.stations_config import DMQ_BOUNDING_BOX
+from src.ingest_ant import ANT_NATIONAL_ENTITY_PREFIXES, ANT_PASTED_COORDINATES_MONTH
 from src.run_pipeline import (
     MAX_SIN_DATO_PCT_PER_YEAR,
+    MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN,
+    MONTHS_EXEMPT_FROM_VOLUME_CHECK,
     RAIN_POSITIVE_PCT_RANGE,
     verify_climate_coverage,
+    verify_monthly_volume,
 )
 from src.spatiotemporal_join import CLIMATE_ASSIGNMENT_TYPES
 
@@ -41,6 +45,35 @@ def test_coverage_check_rejects_year_without_climate_data():
 def test_coverage_check_rejects_zero_filled_precipitation():
     with pytest.raises(AssertionError, match="positive precipitation"):
         verify_climate_coverage(_synthetic_years(sin_dato_pct=0.0, rain_pct=0.0))
+
+
+# --- Monthly volume assertions (no processed data required) ---------------------------
+
+def _synthetic_year(year: int, counts: dict, baseline: int = 300) -> pd.DataFrame:
+    dates = []
+    for month in range(1, 13):
+        n = counts.get(month, baseline)
+        dates += [f"{year}-{month:02d}-15"] * n
+    return pd.DataFrame({"fecha": dates})
+
+
+def test_volume_check_accepts_stable_months():
+    volume = verify_monthly_volume(_synthetic_year(2024, {6: 220}))
+    assert len(volume) == 12
+    assert (volume["razon"] >= MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN).all()
+
+
+def test_volume_check_ignores_documented_exceptions():
+    volume = verify_monthly_volume(_synthetic_year(2024, {12: 10}))
+    exempt = volume[volume["exento"]]
+    assert set(exempt.index.astype(str)) <= set(MONTHS_EXEMPT_FROM_VOLUME_CHECK)
+    assert (exempt["razon"] < MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN).all()
+
+
+def test_volume_check_rejects_a_collapsed_month():
+    collapsed = pd.DataFrame({"fecha": ["2024-01-15"] * 300 + ["2024-02-15"] * 300 + ["2024-03-15"] * 20})
+    with pytest.raises(AssertionError, match="below 50%"):
+        verify_monthly_volume(collapsed)
 
 
 # --- Integrated dataset ---------------------------------------------------------------
@@ -105,6 +138,19 @@ def test_annual_climate_coverage(integrated_df):
     assert (coverage["sin_dato"] <= MAX_SIN_DATO_PCT_PER_YEAR).all()
     low, high = RAIN_POSITIVE_PCT_RANGE
     assert coverage["lluvia_1h_positiva"].between(low, high).all()
+
+
+def test_december_2024_keeps_only_national_entity_records(integrated_df):
+    """Municipal December 2024 records carry pasted coordinates and must be absent."""
+    month = pd.to_datetime(integrated_df["fecha"]).dt.to_period("M")
+    december = integrated_df[month == pd.Period(ANT_PASTED_COORDINATES_MONTH)]
+    prefixes = december["id_siniestro"].str[:3]
+    assert prefixes.isin(ANT_NATIONAL_ENTITY_PREFIXES).all(), prefixes.value_counts().to_dict()
+
+
+def test_monthly_volume_has_no_undocumented_collapse(integrated_df):
+    volume = verify_monthly_volume(integrated_df)
+    assert (volume.loc[~volume["exento"], "razon"] >= MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN).all()
 
 
 def test_no_value_mass_at_global_median(integrated_df):

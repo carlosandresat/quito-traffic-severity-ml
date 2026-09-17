@@ -36,6 +36,58 @@ MAX_SIN_DATO_PCT_PER_YEAR: float = 5.0
 # indicate a broken meteorological alignment (e.g. zero-filled or constant rain).
 RAIN_POSITIVE_PCT_RANGE: tuple = (3.0, 30.0)
 
+# Minimum monthly volume of georeferenced crashes, as a share of the median month
+# of the same year. A month far below this bound signals a source defect rather
+# than a change in crash frequency: it is the check that would have caught the
+# December 2024 coordinate overwrite (auditorias/I_diciembre_2024.md).
+MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN: float = 0.5
+
+# Months exempt from the volume check, with the documented reason.
+MONTHS_EXEMPT_FROM_VOLUME_CHECK: dict = {
+    "2023-10": "not published in the 2017-2023 ANT file",
+    "2023-11": "not published in the 2017-2023 ANT file",
+    "2023-12": "not published in the 2017-2023 ANT file",
+    "2024-12": "coordinates overwritten in the source workbook (Task I)",
+    "2020-04": "strict COVID-19 lockdown: a real drop in circulation, not a defect",
+}
+
+
+def verify_monthly_volume(df: pd.DataFrame) -> pd.DataFrame:
+    """Asserts that no month collapses relative to the median month of its year.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Final integrated dataframe with a 'fecha' column.
+
+    Returns
+    -------
+    pd.DataFrame
+        Monthly counts, the median of their year and the ratio between both, for
+        every month of the study period (months without records included).
+
+    Raises
+    ------
+    AssertionError
+        If a month not listed in ``MONTHS_EXEMPT_FROM_VOLUME_CHECK`` falls below
+        ``MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN`` of its annual median.
+    """
+    months = pd.to_datetime(df["fecha"]).dt.to_period("M")
+    span = pd.period_range(months.min(), months.max(), freq="M")
+    counts = months.value_counts().reindex(span, fill_value=0).sort_index()
+
+    volume = pd.DataFrame({"n": counts})
+    volume["mediana_anio"] = counts.groupby(counts.index.year).transform("median")
+    volume["razon"] = volume["n"] / volume["mediana_anio"]
+    volume["exento"] = [str(m) in MONTHS_EXEMPT_FROM_VOLUME_CHECK for m in volume.index]
+
+    collapsed = volume[(~volume["exento"]) & (volume["razon"] < MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN)]
+    assert collapsed.empty, (
+        f"Error: Months below {MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN:.0%} of their annual median:\n"
+        f"{collapsed.round(3).to_string()}"
+    )
+    return volume
+
 
 def verify_climate_coverage(df: pd.DataFrame) -> pd.DataFrame:
     """Asserts annual meteorological coverage of the integrated dataset.
@@ -150,7 +202,14 @@ def verify_integrated_dataset(df: pd.DataFrame) -> bool:
         "Error: Direct assignment does not use the nearest station"
     print("[x] Climate assignment: Labels valid and consistent with station and value availability.")
 
-    # 7. Annual climate coverage
+    # 7. Monthly volume of georeferenced records
+    volume = verify_monthly_volume(df)
+    exempt = volume[volume["exento"]]
+    print(f"[x] Monthly volume: every month reaches {MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN:.0%} of its annual median, "
+          f"except {len(exempt)} documented months:")
+    print(exempt[["n", "mediana_anio", "razon"]].round(3).to_string())
+
+    # 8. Annual climate coverage
     coverage = verify_climate_coverage(df)
     print(f"[x] Climate coverage: 'sin_dato' <= {MAX_SIN_DATO_PCT_PER_YEAR}% and positive rain share within "
           f"{RAIN_POSITIVE_PCT_RANGE} % in every year (fallback reported, not asserted):")

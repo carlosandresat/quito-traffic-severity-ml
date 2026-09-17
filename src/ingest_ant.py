@@ -41,6 +41,23 @@ VEHICLE_COLUMNS: List[str] = [
     "TRICIMOTO", "VEHICULO_DEPORTIVO_UTILITARIO", "SUMA_DE_VEHICULOS"
 ]
 
+# In the 2024 workbook, the December block of the municipal traffic agencies
+# carries, row by row, the coordinates of the first 827 records of January 2024;
+# the original locations are not present in any available source and cannot be
+# reconstructed (auditorias/I_diciembre_2024.md). The national blocks (ATM, CTE
+# and the national police) are unaffected. These coordinates are invalidated
+# before the spatial filter, which then discards the affected records: December
+# 2024 is a month without valid georeferencing, like October-December 2023.
+ANT_PASTED_COORDINATES_SHEET: str = "BDD_2024"
+ANT_PASTED_COORDINATES_MONTH: str = "2024-12"
+ANT_NATIONAL_ENTITY_PREFIXES: List[str] = ["ATM", "CTE", "PNE"]
+
+# Defensive bound on the same defect for any future delivery: share of records of
+# a month whose exact coordinate also appears in another month of the same
+# workbook under a different canton. Observed values are zero once the rule above
+# is applied, and 58-60% in the two months involved in the defect.
+MAX_CROSS_MONTH_COORDINATE_COPY_SHARE: float = 0.01
+
 
 def assign_mobility_period(dates: pd.Series) -> pd.Series:
     """Classifies temporal records according to COVID-19 mobility regimes in Quito.
@@ -151,6 +168,98 @@ def parse_cause_code(cause_series: pd.Series) -> pd.Series:
     return numeric
 
 
+def invalidate_pasted_coordinates(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+    """Voids the December 2024 coordinates copied from January 2024.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw workbook records, before any spatial filtering.
+    sheet_name : str
+        Worksheet the records come from; the rule only applies to
+        ``ANT_PASTED_COORDINATES_SHEET``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Records where the affected coordinates are set to NaN, so that the
+        spatial filter of ``standardize_ant_dataframe`` removes them. No
+        coordinate is imputed or geocoded.
+    """
+    if sheet_name != ANT_PASTED_COORDINATES_SHEET:
+        return df
+
+    dates = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
+    entity_prefix = df["SINIESTROS"].astype(str).str[:3]
+    pasted = (
+        (dates.dt.to_period("M") == pd.Period(ANT_PASTED_COORDINATES_MONTH))
+        & ~entity_prefix.isin(ANT_NATIONAL_ENTITY_PREFIXES)
+    )
+
+    df = df.copy()
+    df.loc[pasted, ["LATITUD_Y", "LONGITUD_X"]] = np.nan
+    print(f"    Invalidated {int(pasted.sum()):,} {ANT_PASTED_COORDINATES_MONTH} coordinates "
+          f"copied from January 2024 (non-national reporting entities).")
+    return df
+
+
+def count_cross_month_coordinate_copies(df: pd.DataFrame) -> pd.Series:
+    """Counts records whose exact coordinate reappears in another month under another canton.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw workbook records with 'FECHA', 'LATITUD_Y', 'LONGITUD_X' and 'DPA_2'.
+
+    Returns
+    -------
+    pd.Series
+        Share of such records per month (period index), for months with records.
+    """
+    located = df[["FECHA", "LATITUD_Y", "LONGITUD_X", "DPA_2"]].copy()
+    located["mes"] = pd.to_datetime(located["FECHA"], dayfirst=True, errors="coerce").dt.to_period("M")
+    located["lat"] = pd.to_numeric(located["LATITUD_Y"], errors="coerce")
+    located["lon"] = pd.to_numeric(located["LONGITUD_X"], errors="coerce")
+    located = located.dropna(subset=["mes", "lat", "lon"])
+
+    triples = located[["lat", "lon", "mes", "DPA_2"]].drop_duplicates()
+    pairs = triples.merge(triples, on=["lat", "lon"], suffixes=("", "_otro"))
+    copied = pairs[(pairs["mes"] != pairs["mes_otro"]) & (pairs["DPA_2"] != pairs["DPA_2_otro"])]
+    copied = copied[["lat", "lon", "mes", "DPA_2"]].drop_duplicates().assign(copiada=True)
+
+    flagged = located.merge(copied, on=["lat", "lon", "mes", "DPA_2"], how="left")
+    return flagged.groupby("mes")["copiada"].apply(lambda s: s.fillna(False).mean())
+
+
+def verify_no_cross_month_coordinate_copies(df: pd.DataFrame, label: str) -> pd.Series:
+    """Asserts that no month reuses another month's coordinates under another canton.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw workbook records, after ``invalidate_pasted_coordinates``.
+    label : str
+        Source identifier reported in the error message.
+
+    Returns
+    -------
+    pd.Series
+        Share of copied coordinates per month.
+
+    Raises
+    ------
+    AssertionError
+        If any month exceeds ``MAX_CROSS_MONTH_COORDINATE_COPY_SHARE``.
+    """
+    share = count_cross_month_coordinate_copies(df)
+    excess = share[share > MAX_CROSS_MONTH_COORDINATE_COPY_SHARE]
+    assert excess.empty, (
+        f"Error: {label} reuses coordinates across months under a different canton:\n"
+        f"{(excess * 100).round(2).to_string()}"
+    )
+    return share
+
+
 def ingest_ant_csv(csv_path: Path) -> pd.DataFrame:
     """Ingests and filters the consolidated 2017–2023 ANT CSV file for Quito.
 
@@ -204,6 +313,9 @@ def ingest_ant_xlsx(xlsx_path: Path, sheet_name: str) -> pd.DataFrame:
         usecols=lambda col: col in CANONICAL_COLUMNS,
         engine="openpyxl"
     )
+
+    df = invalidate_pasted_coordinates(df, sheet_name)
+    verify_no_cross_month_coordinate_copies(df, f"{xlsx_path.name} ({sheet_name})")
 
     # Filter strictly for Quito canton
     mask_quito = (
