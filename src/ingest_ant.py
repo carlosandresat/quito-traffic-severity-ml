@@ -20,6 +20,11 @@ repo_root = current_dir.parent
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
+from config.category_mappings import (
+    CAUSA_PROBABLE_CANONICAL,
+    PARROQUIA_CANONICAL,
+    TIPO_SINIESTRO_CANONICAL,
+)
 from config.stations_config import DMQ_BOUNDING_BOX
 from src.utils import filter_spatial_bounds, derive_severity_label
 
@@ -166,6 +171,67 @@ def parse_cause_code(cause_series: pd.Series) -> pd.Series:
     cleaned = cause_series.astype(str).str.strip().str.lstrip("C").str.lstrip("c")
     numeric = pd.to_numeric(cleaned, errors="coerce").fillna(0).astype(np.int16)
     return numeric
+
+
+def normalize_category_text(values: pd.Series) -> pd.Series:
+    """Uppercases, trims and collapses the internal whitespace of categorical text.
+
+    Parameters
+    ----------
+    values : pd.Series
+        Raw categorical text.
+
+    Returns
+    -------
+    pd.Series
+        Normalized text; spelling is not altered.
+    """
+    return values.astype(str).str.strip().str.upper().str.replace(r"\s+", " ", regex=True)
+
+
+def harmonize_categories(df: pd.DataFrame) -> pd.DataFrame:
+    """Applies the canonical ANT taxonomies to the standardized categorical columns.
+
+    Crash types and parishes are mapped by text; probable causes are mapped by
+    ``codigo_causa``, because the same code is written with two spellings across
+    source periods and the code is the stable key. Values absent from the tables
+    are kept as observed and reported, so that a future catalogue change is
+    visible instead of silently recoded.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Standardized dataframe with 'tipo_siniestro', 'codigo_causa',
+        'causa_probable' and 'parroquia'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe with harmonized categorical columns.
+    """
+    df = df.copy()
+    before = df[["tipo_siniestro", "causa_probable", "parroquia"]].copy()
+
+    crash_types = normalize_category_text(df["tipo_siniestro"])
+    mapped_types = crash_types.map(TIPO_SINIESTRO_CANONICAL)
+    df["tipo_siniestro"] = mapped_types.fillna(crash_types)
+
+    causes = normalize_category_text(df["causa_probable"])
+    mapped_causes = df["codigo_causa"].map(CAUSA_PROBABLE_CANONICAL)
+    df["causa_probable"] = mapped_causes.fillna(causes)
+
+    df["parroquia"] = normalize_category_text(df["parroquia"]).replace(PARROQUIA_CANONICAL)
+
+    for column, unmapped in [("tipo_siniestro", crash_types[mapped_types.isna()]),
+                             ("causa_probable", causes[mapped_causes.isna()])]:
+        if not unmapped.empty:
+            print(f"[!] Warning: {len(unmapped):,} records with unmapped {column} kept as observed: "
+                  f"{sorted(unmapped.unique())[:5]}")
+
+    changed = (before != df[["tipo_siniestro", "causa_probable", "parroquia"]]).sum()
+    print("[x] Harmonized categorical taxonomies (records rewritten): "
+          + ", ".join(f"{col} {int(n):,}" for col, n in changed.items()))
+    return df
 
 
 def invalidate_pasted_coordinates(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
@@ -396,7 +462,7 @@ def standardize_ant_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # Drop any records with unresolvable dates
     out = out.dropna(subset=["fecha", "lat", "lon"]).reset_index(drop=True)
-    return out
+    return harmonize_categories(out)
 
 
 def run_ant_ingestion(

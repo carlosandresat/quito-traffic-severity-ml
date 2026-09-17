@@ -1,9 +1,12 @@
 """Integrity and climate coverage tests for the integrated research dataset."""
 
+import unicodedata
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from config.category_mappings import TIPO_SINIESTRO_CANONICAL
 from config.stations_config import DMQ_BOUNDING_BOX
 from src.ingest_ant import ANT_NATIONAL_ENTITY_PREFIXES, ANT_PASTED_COORDINATES_MONTH
 from src.run_pipeline import (
@@ -138,6 +141,25 @@ def test_annual_climate_coverage(integrated_df):
     assert (coverage["sin_dato"] <= MAX_SIN_DATO_PCT_PER_YEAR).all()
     low, high = RAIN_POSITIVE_PCT_RANGE
     assert coverage["lluvia_1h_positiva"].between(low, high).all()
+
+
+def test_categorical_taxonomies_are_canonical(integrated_df):
+    crash_types = set(integrated_df["tipo_siniestro"].unique())
+    assert crash_types <= set(TIPO_SINIESTRO_CANONICAL.values()), crash_types
+    assert "AMAGUANIA" not in set(integrated_df["parroquia"].unique())
+
+
+def test_no_category_differs_only_by_spelling(integrated_df):
+    """Accent-insensitive folding must not collapse two surviving categories into one."""
+    for column in ["tipo_siniestro", "causa_probable", "parroquia"]:
+        values = integrated_df[column].unique()
+        folded = {unicodedata.normalize("NFKD", v).encode("ascii", "ignore").decode() for v in values}
+        assert len(folded) == len(values), column
+
+
+def test_each_cause_code_has_a_single_text(integrated_df):
+    texts_per_code = integrated_df.groupby("codigo_causa")["causa_probable"].nunique()
+    assert (texts_per_code == 1).all(), texts_per_code[texts_per_code > 1].to_dict()
 
 
 def test_december_2024_keeps_only_national_entity_records(integrated_df):
