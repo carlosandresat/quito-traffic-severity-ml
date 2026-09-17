@@ -46,6 +46,12 @@ VEHICLE_COLUMNS: List[str] = [
     "TRICIMOTO", "VEHICULO_DEPORTIVO_UTILITARIO", "SUMA_DE_VEHICULOS"
 ]
 
+# Value written by the hour parser when the source hour cannot be read at all.
+# Records that take it are flagged in 'hora_sintetica' instead of being confused
+# with genuine midday crashes (auditorias/C_auditoria_ant.md, section 1.4).
+DEFAULT_HOUR: int = 12
+DEFAULT_TIME: str = "12:00"
+
 # In the 2024 workbook, the December block of the municipal traffic agencies
 # carries, row by row, the coordinates of the first 827 records of January 2024;
 # the original locations are not present in any available source and cannot be
@@ -111,7 +117,7 @@ def parse_standard_dates(date_series: pd.Series) -> pd.Series:
     return parsed.dt.strftime("%Y-%m-%d")
 
 
-def parse_standard_hours(hour_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
+def parse_standard_hours(hour_series: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """Parses heterogeneous hour strings or time objects into integer hours and timestamps.
 
     Parameters
@@ -121,25 +127,27 @@ def parse_standard_hours(hour_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
 
     Returns
     -------
-    Tuple[pd.Series, pd.Series]
+    Tuple[pd.Series, pd.Series, pd.Series]
         - hour_int: Integer hour from 0 to 23.
         - time_str: Formatted HH:MM string.
+        - synthetic: True where the source hour could not be read and the default
+          value was used, so that genuine midday records are not confused with it.
     """
     def _extract_hour(val: any) -> int:
         if pd.isna(val):
-            return 12  # default fallback if completely unresolvable
+            return DEFAULT_HOUR
         if hasattr(val, "hour"):
             return int(val.hour)
         s = str(val).strip()
         parts = s.split(":")
         if len(parts) >= 1 and parts[0].isdigit():
             h = int(parts[0])
-            return h if 0 <= h <= 23 else 12
-        return 12
+            return h if 0 <= h <= 23 else DEFAULT_HOUR
+        return DEFAULT_HOUR
 
     def _extract_time_str(val: any) -> str:
         if pd.isna(val):
-            return "12:00"
+            return DEFAULT_TIME
         if hasattr(val, "strftime"):
             return val.strftime("%H:%M")
         s = str(val).strip()
@@ -147,12 +155,22 @@ def parse_standard_hours(hour_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
         if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
             h = int(parts[0])
             m = int(parts[1])
-            return f"{h:02d}:{m:02d}"
-        return "12:00"
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return f"{h:02d}:{m:02d}"
+        return DEFAULT_TIME
+
+    def _is_synthetic(val: any) -> bool:
+        if pd.isna(val) or hasattr(val, "strftime"):
+            return bool(pd.isna(val))
+        parts = str(val).strip().split(":")
+        readable = (len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit()
+                    and 0 <= int(parts[0]) <= 23 and 0 <= int(parts[1]) <= 59)
+        return not readable
 
     hour_int = hour_series.apply(_extract_hour).astype(np.int8)
     time_str = hour_series.apply(_extract_time_str).astype(str)
-    return hour_int, time_str
+    synthetic = hour_series.apply(_is_synthetic)
+    return hour_int, time_str, synthetic
 
 
 def parse_cause_code(cause_series: pd.Series) -> pd.Series:
@@ -171,6 +189,33 @@ def parse_cause_code(cause_series: pd.Series) -> pd.Series:
     cleaned = cause_series.astype(str).str.strip().str.lstrip("C").str.lstrip("c")
     numeric = pd.to_numeric(cleaned, errors="coerce").fillna(0).astype(np.int16)
     return numeric
+
+
+def flag_clustered_coordinates(df: pd.DataFrame) -> pd.DataFrame:
+    """Flags crashes whose exact coordinate is shared with at least one other crash.
+
+    Repeated exact coordinates indicate geocoding to an administrative centroid
+    rather than the crash site: the twenty most repeated points carry between 22
+    and 151 distinct street addresses, the phenomenon collapses after April 2022
+    and fatality is lower at those points (auditorias/C_auditoria_ant.md, section
+    1.3). The flag supports stratified sensitivity analyses; it is not a measure
+    of road risk.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Standardized dataframe of the whole corpus, with 'lat' and 'lon'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe with the boolean column 'coordenada_agrupada'.
+    """
+    df = df.copy()
+    df["coordenada_agrupada"] = df.duplicated(subset=["lat", "lon"], keep=False)
+    print(f"[x] Clustered geocoding: {int(df['coordenada_agrupada'].sum()):,} crashes "
+          f"({df['coordenada_agrupada'].mean() * 100:.2f}%) share an exact coordinate.")
+    return df
 
 
 def normalize_category_text(values: pd.Series) -> pd.Series:
@@ -424,9 +469,10 @@ def standardize_ant_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # Temporal standardization
     out["fecha"] = parse_standard_dates(df["FECHA"])
-    hour_int, time_str = parse_standard_hours(df["HORA"])
+    hour_int, time_str, synthetic_hour = parse_standard_hours(df["HORA"])
     out["hora"] = hour_int
     out["hora_str"] = time_str
+    out["hora_sintetica"] = synthetic_hour.to_numpy(dtype=bool)
     out["dia_nombre"] = df["DIA_1"].astype(str).str.strip().str.upper()
     out["dia_semana"] = pd.to_numeric(df["DIA_2"], errors="coerce").fillna(1).astype(np.int8)
     out["mes"] = pd.to_numeric(df["MES_2"], errors="coerce").fillna(1).astype(np.int8)
@@ -462,6 +508,7 @@ def standardize_ant_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # Drop any records with unresolvable dates
     out = out.dropna(subset=["fecha", "lat", "lon"]).reset_index(drop=True)
+    out = flag_clustered_coordinates(out)
     return harmonize_categories(out)
 
 
@@ -543,6 +590,10 @@ def run_ant_ingestion(
     year_counts = clean_df["anio"].value_counts().sort_index()
     for yr, cnt in year_counts.items():
         print(f"  Year {yr}: {cnt:,} crashes")
+
+    n_synthetic = int(clean_df["hora_sintetica"].sum())
+    print(f"\n--- Data Quality Flags ---\n  Synthetic hours (source hour unreadable): "
+          f"{n_synthetic:,} ({n_synthetic / len(clean_df) * 100:.2f}%)")
 
     print("\n--- Severity Distribution ---")
     sev_counts = clean_df["severidad"].value_counts().sort_index()

@@ -1,5 +1,7 @@
 """Tests for ANT source defects handled during ingestion (no processed data required)."""
 
+import datetime
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,8 +10,10 @@ from config.category_mappings import CAUSA_PROBABLE_CANONICAL, TIPO_SINIESTRO_CA
 from src.ingest_ant import (
     ANT_PASTED_COORDINATES_SHEET,
     count_cross_month_coordinate_copies,
+    flag_clustered_coordinates,
     harmonize_categories,
     invalidate_pasted_coordinates,
+    parse_standard_hours,
     verify_no_cross_month_coordinate_copies,
 )
 
@@ -131,3 +135,23 @@ def test_unknown_categories_are_kept_as_observed():
 
 def test_cause_codes_and_texts_are_one_to_one():
     assert len(set(CAUSA_PROBABLE_CANONICAL.values())) == len(CAUSA_PROBABLE_CANONICAL)
+
+
+# --- Data quality flags ---------------------------------------------------------------
+
+def test_only_unreadable_hours_are_flagged_as_synthetic():
+    raw = pd.Series(["12:00", "07:35", None, "SIN DATO", "25:10", datetime.time(12, 0)])
+    hour, text, synthetic = parse_standard_hours(raw)
+    assert synthetic.tolist() == [False, False, True, True, True, False]
+    assert hour.tolist() == [12, 7, 12, 12, 12, 12]
+    assert text.tolist() == ["12:00", "07:35", "12:00", "12:00", "12:00", "12:00"]
+
+
+def test_clustered_coordinates_flag_repeated_points_only():
+    crashes = pd.DataFrame({
+        "lat": [-0.18, -0.18, -0.25, -0.18001],
+        "lon": [-78.49, -78.49, -78.52, -78.49],
+    })
+    flagged = flag_clustered_coordinates(crashes)
+    assert flagged["coordenada_agrupada"].tolist() == [True, True, False, False]
+    assert flagged["coordenada_agrupada"].dtype == bool
