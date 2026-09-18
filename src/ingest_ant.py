@@ -69,6 +69,16 @@ ANT_NATIONAL_ENTITY_PREFIXES: List[str] = ["ATM", "CTE", "PNE"]
 # is applied, and 58-60% in the two months involved in the defect.
 MAX_CROSS_MONTH_COORDINATE_COPY_SHARE: float = 0.01
 
+# In March 2020, the ANT source overwrites 'TIPO_DE_SINIESTRO', 'CAUSA_PROBABLE'
+# and 'CODIGO_CAUSA' for every control entity at once: 221 of 226 Quito records
+# collapse to 'ARROLLAMIENTOS' and all 226 share one cause text and one code,
+# nationally 93.00% and 99.54% (auditorias/G_dictamen_preparacion_modelado.md,
+# section 12). Severity is unaffected because it derives from 'LESIONADOS' and
+# 'FALLECIDOS', which the overwrite does not touch. The three taxonomy columns
+# are masked to NaN for this month; no record is dropped.
+MASKED_TAXONOMY_MONTH: str = "2020-03"
+MASKED_TAXONOMY_COLUMNS: List[str] = ["tipo_siniestro", "causa_probable", "codigo_causa"]
+
 
 def assign_mobility_period(dates: pd.Series) -> pd.Series:
     """Classifies temporal records according to COVID-19 mobility regimes in Quito.
@@ -314,6 +324,34 @@ def invalidate_pasted_coordinates(df: pd.DataFrame, sheet_name: str) -> pd.DataF
     return df
 
 
+def mask_overwritten_march_2020_taxonomy(df: pd.DataFrame) -> pd.DataFrame:
+    """Masks the crash-taxonomy columns overwritten by the source in March 2020.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Standardized dataframe, after ``harmonize_categories``, with 'fecha',
+        'tipo_siniestro', 'causa_probable' and 'codigo_causa'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same records; 'tipo_siniestro', 'causa_probable' and 'codigo_causa' are
+        NaN for crashes in ``MASKED_TAXONOMY_MONTH``. 'codigo_causa' becomes the
+        pandas nullable integer dtype 'Int16', so no other record turns to float.
+    """
+    df = df.copy()
+    df["codigo_causa"] = df["codigo_causa"].astype("Int16")
+
+    mask = pd.to_datetime(df["fecha"]).dt.to_period("M") == pd.Period(MASKED_TAXONOMY_MONTH)
+    for column in MASKED_TAXONOMY_COLUMNS:
+        df.loc[mask, column] = np.nan
+
+    print(f"[x] Masked overwritten source taxonomy for {MASKED_TAXONOMY_MONTH}: "
+          f"{int(mask.sum()):,} records set to NaN in {MASKED_TAXONOMY_COLUMNS}.")
+    return df
+
+
 def count_cross_month_coordinate_copies(df: pd.DataFrame) -> pd.Series:
     """Counts records whose exact coordinate reappears in another month under another canton.
 
@@ -509,7 +547,8 @@ def standardize_ant_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # Drop any records with unresolvable dates
     out = out.dropna(subset=["fecha", "lat", "lon"]).reset_index(drop=True)
     out = flag_clustered_coordinates(out)
-    return harmonize_categories(out)
+    out = harmonize_categories(out)
+    return mask_overwritten_march_2020_taxonomy(out)
 
 
 def run_ant_ingestion(

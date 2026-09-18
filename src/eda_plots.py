@@ -417,11 +417,14 @@ def generate_interactive_folium_map(
     def fmt(value: Any, unit: str) -> str:
         return "N/A" if pd.isna(value) else f"{value:.1f} {unit}"
 
+    def _cause(value: Any) -> str:
+        return "N/A" if pd.isna(value) else str(value)[:40]
+
     for _, row in fatal_df.iterrows():
         popup_txt = f"""
         <b>Crash ID:</b> {row.get('id_siniestro', 'N/A')}<br>
         <b>Date:</b> {row['fecha']} {row['hora_str']}<br>
-        <b>Cause:</b> {row.get('causa_probable', 'N/A')[:40]}...<br>
+        <b>Cause:</b> {_cause(row.get('causa_probable'))}...<br>
         <b>Weather Station:</b> {row.get('estacion_climatica_utilizada', 'N/A')} ({row.get('distancia_climatica_utilizada_km', 0):.2f} km, {row.get('asignacion_clima', 'N/A')})<br>
         <b>Precipitation:</b> {fmt(row.get('lluvia_1h'), 'mm/h')}<br>
         <b>Temperature:</b> {fmt(row.get('tmp'), '°C')}

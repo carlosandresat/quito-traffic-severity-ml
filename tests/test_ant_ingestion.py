@@ -9,10 +9,12 @@ import pytest
 from config.category_mappings import CAUSA_PROBABLE_CANONICAL, TIPO_SINIESTRO_CANONICAL
 from src.ingest_ant import (
     ANT_PASTED_COORDINATES_SHEET,
+    MASKED_TAXONOMY_MONTH,
     count_cross_month_coordinate_copies,
     flag_clustered_coordinates,
     harmonize_categories,
     invalidate_pasted_coordinates,
+    mask_overwritten_march_2020_taxonomy,
     parse_standard_hours,
     verify_no_cross_month_coordinate_copies,
 )
@@ -155,3 +157,28 @@ def test_clustered_coordinates_flag_repeated_points_only():
     flagged = flag_clustered_coordinates(crashes)
     assert flagged["coordenada_agrupada"].tolist() == [True, True, False, False]
     assert flagged["coordenada_agrupada"].dtype == bool
+
+
+# --- March 2020 taxonomy overwrite ------------------------------------------------------
+
+def test_march_2020_taxonomy_is_masked_without_dropping_rows():
+    records = pd.DataFrame({
+        "fecha": ["2020-02-28", "2020-03-05", "2020-03-20", "2020-04-01"],
+        "tipo_siniestro": ["CHOQUE LATERAL", "ARROLLAMIENTOS", "ARROLLAMIENTOS", "ATROPELLOS"],
+        "causa_probable": ["A", "B", "B", "C"],
+        "codigo_causa": np.array([1, 14, 14, 2], dtype=np.int16),
+        "severidad": [0, 2, 1, 0],
+        "lesionados": [0, 0, 1, 0],
+        "fallecidos": [0, 1, 0, 0],
+    })
+    masked = mask_overwritten_march_2020_taxonomy(records)
+
+    march = pd.to_datetime(masked["fecha"]).dt.to_period("M").astype(str) == MASKED_TAXONOMY_MONTH
+    assert march.tolist() == [False, True, True, False]
+    assert masked.loc[march, ["tipo_siniestro", "causa_probable", "codigo_causa"]].isna().all().all()
+    assert masked.loc[~march, ["tipo_siniestro", "causa_probable", "codigo_causa"]].notna().all().all()
+    assert len(masked) == len(records)
+    assert str(masked["codigo_causa"].dtype) == "Int16"
+    pd.testing.assert_series_equal(masked["severidad"], records["severidad"])
+    pd.testing.assert_series_equal(masked["lesionados"], records["lesionados"])
+    pd.testing.assert_series_equal(masked["fallecidos"], records["fallecidos"])
