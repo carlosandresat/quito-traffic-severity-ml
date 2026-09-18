@@ -8,14 +8,16 @@ import pytest
 
 from config.category_mappings import TIPO_SINIESTRO_CANONICAL
 from config.stations_config import DMQ_BOUNDING_BOX
-from src.ingest_ant import ANT_NATIONAL_ENTITY_PREFIXES, ANT_PASTED_COORDINATES_MONTH
+from src.ingest_ant import ANT_NATIONAL_ENTITY_PREFIXES, ANT_PASTED_COORDINATES_MONTH, MASKED_TAXONOMY_MONTH
 from src.run_pipeline import (
+    CATEGORY_COLLAPSE_DOCUMENTED_EXCEPTIONS,
     MAX_SIN_DATO_PCT_PER_YEAR,
     MIN_MONTHLY_SHARE_OF_YEAR_MEDIAN,
     MONTHS_EXEMPT_FROM_VOLUME_CHECK,
     RAIN_POSITIVE_PCT_RANGE,
     verify_climate_coverage,
     verify_monthly_volume,
+    verify_no_category_collapse,
 )
 from src.spatiotemporal_join import CLIMATE_ASSIGNMENT_TYPES
 
@@ -77,6 +79,40 @@ def test_volume_check_rejects_a_collapsed_month():
     collapsed = pd.DataFrame({"fecha": ["2024-01-15"] * 300 + ["2024-02-15"] * 300 + ["2024-03-15"] * 20})
     with pytest.raises(AssertionError, match="below 50%"):
         verify_monthly_volume(collapsed)
+
+
+# --- Category collapse scan (no processed data required) ------------------------------
+
+def _months_with_stable_categories(n_per_month: int = 50, n_months: int = 12) -> pd.DataFrame:
+    values = ["A", "B", "C", "D"]
+    rows = []
+    for m in range(1, n_months + 1):
+        for i in range(n_per_month):
+            rows.append({"fecha": f"2024-{m:02d}-10", "tipo_siniestro": values[i % len(values)]})
+    return pd.DataFrame(rows)
+
+
+def test_category_collapse_check_accepts_a_stable_corpus():
+    shares = verify_no_category_collapse(_months_with_stable_categories())
+    assert (shares["moda_pct"] < 50).all()
+
+
+def test_category_collapse_check_rejects_an_undocumented_overwrite():
+    df = _months_with_stable_categories()
+    overwritten = pd.to_datetime(df["fecha"]).dt.to_period("M").astype(str) == "2024-06"
+    df.loc[overwritten, "tipo_siniestro"] = "ARROLLAMIENTOS"
+    with pytest.raises(AssertionError, match="Undocumented monthly category collapse"):
+        verify_no_category_collapse(df)
+
+
+def test_category_collapse_check_ignores_documented_exceptions():
+    df = _months_with_stable_categories()
+    documented_month = next(iter(CATEGORY_COLLAPSE_DOCUMENTED_EXCEPTIONS))
+    year, month = documented_month.split("-")
+    df["fecha"] = df["fecha"].str.replace(r"^2024-06", f"{year}-{month}", regex=True)
+    overwritten = pd.to_datetime(df["fecha"]).dt.to_period("M").astype(str) == documented_month
+    df.loc[overwritten, "tipo_siniestro"] = "ARROLLAMIENTOS"
+    verify_no_category_collapse(df)
 
 
 # --- Integrated dataset ---------------------------------------------------------------
@@ -144,7 +180,7 @@ def test_annual_climate_coverage(integrated_df):
 
 
 def test_categorical_taxonomies_are_canonical(integrated_df):
-    crash_types = set(integrated_df["tipo_siniestro"].unique())
+    crash_types = set(integrated_df["tipo_siniestro"].dropna().unique())
     assert crash_types <= set(TIPO_SINIESTRO_CANONICAL.values()), crash_types
     assert "AMAGUANIA" not in set(integrated_df["parroquia"].unique())
 
@@ -152,9 +188,19 @@ def test_categorical_taxonomies_are_canonical(integrated_df):
 def test_no_category_differs_only_by_spelling(integrated_df):
     """Accent-insensitive folding must not collapse two surviving categories into one."""
     for column in ["tipo_siniestro", "causa_probable", "parroquia"]:
-        values = integrated_df[column].unique()
+        values = integrated_df[column].dropna().unique()
         folded = {unicodedata.normalize("NFKD", v).encode("ascii", "ignore").decode() for v in values}
         assert len(folded) == len(values), column
+
+
+def test_march_2020_taxonomy_is_masked_end_to_end(integrated_df):
+    """Task J: the source overwrite in March 2020 must reach the integrated dataset as NaN."""
+    march = pd.to_datetime(integrated_df["fecha"]).dt.to_period("M") == pd.Period(MASKED_TAXONOMY_MONTH)
+    columns = ["tipo_siniestro", "causa_probable", "codigo_causa"]
+    assert march.sum() > 0
+    assert integrated_df.loc[march, columns].isna().all().all()
+    assert integrated_df.loc[~march, columns].notna().all().all()
+    assert integrated_df.loc[march, ["severidad", "lesionados", "fallecidos"]].notna().all().all()
 
 
 def test_each_cause_code_has_a_single_text(integrated_df):

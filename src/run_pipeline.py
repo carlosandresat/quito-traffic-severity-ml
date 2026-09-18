@@ -56,6 +56,30 @@ MONTHS_EXEMPT_FROM_VOLUME_CHECK: dict = {
     "2020-04": "strict COVID-19 lockdown: a real drop in circulation, not a defect",
 }
 
+# Low-cardinality categorical columns of the final schema scanned for a mass
+# source overwrite, the class of defect found for March 2020
+# (auditorias/G_dictamen_preparacion_modelado.md, section 12): 'JERARQUIA_DE_LA_VIA',
+# 'SERVICIO_1' and 'CONDICION_1' from the raw ad hoc scan are not part of the
+# final schema and are excluded.
+CATEGORY_COLLAPSE_COLUMNS: list = ["tipo_siniestro", "causa_probable", "parroquia", "zona_urbana_rural"]
+
+# Outlier threshold, in median absolute deviations from a column's own median
+# monthly modal share, ported from auditorias/G_scripts/g12_category_collapse_scan.py.
+CATEGORY_COLLAPSE_MAD_THRESHOLD: float = 8.0
+
+# Minimum non-null records a month needs to enter the scan. Below this, the
+# modal share is dominated by sample noise rather than a source defect: December
+# 2024 has only 14 surviving records (Task I, D9) and its modal share is not
+# comparable to a normal month of a few hundred.
+CATEGORY_COLLAPSE_MIN_N: int = 30
+
+# Months excluded from the check, with the documented reason. March 2020 is
+# already masked to NaN by Task J, so this check must catch a new, undocumented
+# overwrite rather than re-flag the one already fixed.
+CATEGORY_COLLAPSE_DOCUMENTED_EXCEPTIONS: dict = {
+    "2020-03": "tipo_siniestro/causa_probable/codigo_causa masked (auditorias/J_marzo_2020.md)",
+}
+
 
 def verify_monthly_volume(df: pd.DataFrame) -> pd.DataFrame:
     """Asserts that no month collapses relative to the median month of its year.
@@ -136,6 +160,67 @@ def verify_climate_coverage(df: pd.DataFrame) -> pd.DataFrame:
         f"{implausible.round(2).to_string()}"
     )
     return coverage
+
+
+def verify_no_category_collapse(df: pd.DataFrame) -> pd.DataFrame:
+    """Detects a month whose categorical modal share collapses to a single value.
+
+    Permanent port of the ad hoc scan in
+    ``auditorias/G_scripts/g12_category_collapse_scan.py`` that found the March
+    2020 taxonomy overwrite (Task J): it must fail again if a future ANT
+    delivery reintroduces the same class of defect in any of
+    ``CATEGORY_COLLAPSE_COLUMNS``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Final integrated dataframe with 'fecha' and the columns in
+        ``CATEGORY_COLLAPSE_COLUMNS``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Modal share (%) of every scanned column, per month with non-null data.
+
+    Raises
+    ------
+    AssertionError
+        If a month outside ``CATEGORY_COLLAPSE_DOCUMENTED_EXCEPTIONS`` has a
+        modal share more than ``CATEGORY_COLLAPSE_MAD_THRESHOLD`` median
+        absolute deviations above the column's own median across months.
+    """
+    months = pd.to_datetime(df["fecha"]).dt.to_period("M").astype(str)
+    rows = []
+    for column in CATEGORY_COLLAPSE_COLUMNS:
+        if column not in df:
+            continue
+        for month, values in df[column].groupby(months):
+            values = values.dropna()
+            if len(values) < CATEGORY_COLLAPSE_MIN_N:
+                continue
+            counts = values.value_counts()
+            rows.append({"anio_mes": month, "columna": column, "n": len(values),
+                         "moda_pct": 100.0 * float(counts.iloc[0]) / len(values),
+                         "moda": str(counts.index[0])[:40]})
+    shares = pd.DataFrame(rows)
+
+    flagged_blocks = []
+    for column, block in shares.groupby("columna"):
+        median = block["moda_pct"].median()
+        scale = max(float((block["moda_pct"] - median).abs().median()), 1.0)
+        block = block.assign(desviaciones_absolutas_medianas=(block["moda_pct"] - median) / scale)
+        flagged_blocks.append(block[
+            (block["desviaciones_absolutas_medianas"] > CATEGORY_COLLAPSE_MAD_THRESHOLD)
+            & (~block["anio_mes"].isin(CATEGORY_COLLAPSE_DOCUMENTED_EXCEPTIONS))
+        ])
+    flagged = pd.concat(flagged_blocks, ignore_index=True) if flagged_blocks else pd.DataFrame()
+
+    assert flagged.empty, (
+        "Error: Undocumented monthly category collapse detected "
+        "(auditorias/G_dictamen_preparacion_modelado.md, section 12):\n"
+        f"{flagged.round(2).to_string()}"
+    )
+    return shares
 
 
 def verify_integrated_dataset(df: pd.DataFrame) -> bool:
@@ -240,6 +325,11 @@ def verify_integrated_dataset(df: pd.DataFrame) -> bool:
     print(f"[x] Climate coverage: 'sin_dato' <= {MAX_SIN_DATO_PCT_PER_YEAR}% and positive rain share within "
           f"{RAIN_POSITIVE_PCT_RANGE} % in every year (fallback reported, not asserted):")
     print(coverage.round(2).to_string())
+
+    # 10. Monthly category collapse (permanent control for the March 2020 defect)
+    verify_no_category_collapse(df)
+    print(f"[x] Category collapse scan: no undocumented monthly overwrite in "
+          f"{CATEGORY_COLLAPSE_COLUMNS}, {list(CATEGORY_COLLAPSE_DOCUMENTED_EXCEPTIONS)} excepted.")
 
     print("=" * 70)
     print("ALL VERIFICATION CHECKS PASSED SUCCESSFULLY [x]")
