@@ -8,9 +8,10 @@ and encodes epidemiological mobility restrictions.
 """
 
 import os
+import re
 import sys
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -29,11 +30,12 @@ from config.stations_config import DMQ_BOUNDING_BOX
 from src.utils import filter_spatial_bounds, derive_severity_label
 
 
-# Canonical feature subset retained across all source files
+# Canonical source columns read from every file. PERIODO_2 is read only to verify
+# the parsed hour and is not exported.
 CANONICAL_COLUMNS: List[str] = [
     "ANIO", "SINIESTROS", "LESIONADOS", "FALLECIDOS", "LATITUD_Y", "LONGITUD_X",
     "DPA_1", "PROVINCIA", "DPA_2", "CANTON", "DPA_3", "PARROQUIA", "DIRECCION",
-    "ZONA", "FECHA", "HORA", "DIA_1", "DIA_2", "MES_1", "MES_2", "FERIADO",
+    "ZONA", "FECHA", "HORA", "PERIODO_2", "DIA_1", "DIA_2", "MES_1", "MES_2", "FERIADO",
     "CODIGO_CAUSA", "CAUSA_PROBABLE", "TIPO_DE_SINIESTRO",
     "AUTOMOVIL", "BICICLETA", "BUS", "CAMION", "CAMIONETA", "EMERGENCIAS",
     "ESPECIAL", "FURGONETA", "MOTOCICLETA", "NO_IDENTIFICADO", "SCOOTER_ELECTRICO",
@@ -127,6 +129,51 @@ def parse_standard_dates(date_series: pd.Series) -> pd.Series:
     return parsed.dt.strftime("%Y-%m-%d")
 
 
+# Accepted textual hour layouts: "HH:MM", "HH:MM:SS", "HH:MM:SS.fff" and the
+# "HHhMM" layout written in some 2024 records (e.g. "01H00", "04H25").
+_HOUR_TEXT_PATTERN = re.compile(r"^(\d{1,2})\s*[:hH]\s*(\d{2})(?::(\d{2})(?:\.(\d+))?)?$")
+
+_SECONDS_PER_DAY = 24 * 3600
+
+
+def _hour_to_seconds(val: Any) -> Optional[int]:
+    """Converts one raw hour value into seconds after midnight, rounded to the second.
+
+    Rounding to the nearest second absorbs the floating-point representation of
+    Excel times in the 2024 workbook, where a crash at 17:00 is stored as
+    16:59:59.942 and would otherwise be truncated into the preceding hour.
+
+    Parameters
+    ----------
+    val : Any
+        Raw value: a time or datetime object, or a string in one of the layouts
+        accepted by ``_HOUR_TEXT_PATTERN``.
+
+    Returns
+    -------
+    Optional[int]
+        Seconds after midnight, or None when the value cannot be read.
+    """
+    if val is None or (not isinstance(val, str) and pd.isna(val)):
+        return None
+    if hasattr(val, "hour"):
+        total = (val.hour * 3600 + val.minute * 60 + val.second
+                 + getattr(val, "microsecond", 0) / 1e6)
+    else:
+        match = _HOUR_TEXT_PATTERN.match(str(val).strip())
+        if match is None:
+            return None
+        h, m = int(match.group(1)), int(match.group(2))
+        s = int(match.group(3)) if match.group(3) else 0
+        frac = float(f"0.{match.group(4)}") if match.group(4) else 0.0
+        if not (0 <= h <= 23 and 0 <= m <= 59 and 0 <= s <= 59):
+            return None
+        total = h * 3600 + m * 60 + s + frac
+    # A value that rounds up to midnight stays at the last second of the day, so
+    # that the date of the record is never shifted.
+    return min(int(round(total)), _SECONDS_PER_DAY - 1)
+
+
 def parse_standard_hours(hour_series: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """Parses heterogeneous hour strings or time objects into integer hours and timestamps.
 
@@ -143,44 +190,49 @@ def parse_standard_hours(hour_series: pd.Series) -> Tuple[pd.Series, pd.Series, 
         - synthetic: True where the source hour could not be read and the default
           value was used, so that genuine midday records are not confused with it.
     """
-    def _extract_hour(val: any) -> int:
-        if pd.isna(val):
-            return DEFAULT_HOUR
-        if hasattr(val, "hour"):
-            return int(val.hour)
-        s = str(val).strip()
-        parts = s.split(":")
-        if len(parts) >= 1 and parts[0].isdigit():
-            h = int(parts[0])
-            return h if 0 <= h <= 23 else DEFAULT_HOUR
-        return DEFAULT_HOUR
-
-    def _extract_time_str(val: any) -> str:
-        if pd.isna(val):
-            return DEFAULT_TIME
-        if hasattr(val, "strftime"):
-            return val.strftime("%H:%M")
-        s = str(val).strip()
-        parts = s.split(":")
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            h = int(parts[0])
-            m = int(parts[1])
-            if 0 <= h <= 23 and 0 <= m <= 59:
-                return f"{h:02d}:{m:02d}"
-        return DEFAULT_TIME
-
-    def _is_synthetic(val: any) -> bool:
-        if pd.isna(val) or hasattr(val, "strftime"):
-            return bool(pd.isna(val))
-        parts = str(val).strip().split(":")
-        readable = (len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit()
-                    and 0 <= int(parts[0]) <= 23 and 0 <= int(parts[1]) <= 59)
-        return not readable
-
-    hour_int = hour_series.apply(_extract_hour).astype(np.int8)
-    time_str = hour_series.apply(_extract_time_str).astype(str)
-    synthetic = hour_series.apply(_is_synthetic)
+    seconds = hour_series.apply(_hour_to_seconds)
+    synthetic = seconds.isna()
+    default_seconds = DEFAULT_HOUR * 3600
+    filled = seconds.fillna(default_seconds).astype(int)
+    hour_int = (filled // 3600).astype(np.int8)
+    time_str = filled.map(lambda t: f"{t // 3600:02d}:{(t % 3600) // 60:02d}").astype(str)
     return hour_int, time_str, synthetic
+
+
+def verify_hours_match_source_period(
+    hour_int: pd.Series, source_period: pd.Series, synthetic: pd.Series, label: str
+) -> None:
+    """Asserts that every readable hour falls in the hourly period published by the source.
+
+    The ANT files publish, next to the hour, the integer hour of the crash in
+    ``PERIODO_2``. A disagreement means the hour was parsed into the wrong
+    period, which would couple the crash to the weather of another hour.
+
+    Parameters
+    ----------
+    hour_int : pd.Series
+        Parsed integer hour.
+    source_period : pd.Series
+        Raw ``PERIODO_2`` column, aligned with ``hour_int``.
+    synthetic : pd.Series
+        Boolean flag of unreadable hours, which are excluded from the check.
+    label : str
+        Description of the source used in the error message.
+
+    Raises
+    ------
+    AssertionError
+        If any readable hour disagrees with the published period.
+    """
+    period = pd.to_numeric(pd.Series(source_period).reset_index(drop=True), errors="coerce")
+    hours = pd.Series(hour_int).reset_index(drop=True)
+    readable = ~pd.Series(synthetic).reset_index(drop=True).astype(bool) & period.notna()
+    mismatched = readable & (hours != period)
+    assert not mismatched.any(), (
+        f"Error: {label} has {int(mismatched.sum())} hours outside the source period "
+        f"PERIODO_2, e.g. parsed {hours[mismatched].head(3).tolist()} "
+        f"against {period[mismatched].head(3).astype(int).tolist()}."
+    )
 
 
 def parse_cause_code(cause_series: pd.Series) -> pd.Series:
@@ -508,6 +560,8 @@ def standardize_ant_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # Temporal standardization
     out["fecha"] = parse_standard_dates(df["FECHA"])
     hour_int, time_str, synthetic_hour = parse_standard_hours(df["HORA"])
+    if "PERIODO_2" in df.columns:
+        verify_hours_match_source_period(hour_int, df["PERIODO_2"], synthetic_hour, "ANT hours")
     out["hora"] = hour_int
     out["hora_str"] = time_str
     out["hora_sintetica"] = synthetic_hour.to_numpy(dtype=bool)

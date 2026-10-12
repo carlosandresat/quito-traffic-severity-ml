@@ -16,6 +16,7 @@ from src.ingest_ant import (
     invalidate_pasted_coordinates,
     mask_overwritten_march_2020_taxonomy,
     parse_standard_hours,
+    verify_hours_match_source_period,
     verify_no_cross_month_coordinate_copies,
 )
 
@@ -147,6 +148,34 @@ def test_only_unreadable_hours_are_flagged_as_synthetic():
     assert synthetic.tolist() == [False, False, True, True, True, False]
     assert hour.tolist() == [12, 7, 12, 12, 12, 12]
     assert text.tolist() == ["12:00", "07:35", "12:00", "12:00", "12:00", "12:00"]
+
+
+def test_excel_floating_point_hours_are_rounded_into_their_period():
+    raw = pd.Series([
+        datetime.time(16, 59, 59, 942000),
+        datetime.time(9, 59, 59, 971000),
+        "22:59:59.942",
+        datetime.time(16, 59, 59),
+        datetime.time(23, 59, 59, 900000),
+    ])
+    hour, text, synthetic = parse_standard_hours(raw)
+    assert hour.tolist() == [17, 10, 23, 16, 23]
+    assert text.tolist() == ["17:00", "10:00", "23:00", "16:59", "23:59"]
+    assert not synthetic.any()
+
+
+def test_hour_letter_layout_is_read():
+    hour, text, synthetic = parse_standard_hours(pd.Series(["01H00", "04H25", "4h25"]))
+    assert hour.tolist() == [1, 4, 4]
+    assert text.tolist() == ["01:00", "04:25", "04:25"]
+    assert not synthetic.any()
+
+
+def test_hours_outside_the_source_period_are_rejected():
+    hour, _, synthetic = parse_standard_hours(pd.Series(["16:30", "08:00", "SIN DATO"]))
+    verify_hours_match_source_period(hour, pd.Series([16, 8, 3]), synthetic, "sample")
+    with pytest.raises(AssertionError, match="outside the source period"):
+        verify_hours_match_source_period(hour, pd.Series([17, 8, 3]), synthetic, "sample")
 
 
 def test_clustered_coordinates_flag_repeated_points_only():
