@@ -81,6 +81,7 @@ quito-traffic-severity-ml/
 │   ├── ingest_ant.py               # ANT crash homogenization, source-defect rules and quality flags
 │   ├── ingest_remmaq.py            # REMMAQ hourly consolidation, hour convention and lag engineering
 │   ├── spatiotemporal_join.py      # Nearest-station matcher, hierarchical fallback and orographic metadata
+│   ├── climatology.py              # Station × month × hour climatology and weather anomalies (modeling)
 │   ├── eda_statistics.py           # Hypothesis tests, odds ratios and LaTeX table export
 │   ├── eda_plots.py                # Publication figures and interactive map
 │   ├── run_eda.py                  # EDA orchestrator
@@ -155,7 +156,7 @@ python src/run_eda.py
 | `hora_sintetica` | The source hour was unreadable and the parser default was used. |
 | `split_set` | Temporal partition. Never a feature. |
 
-Meteorological columns may be missing and are left as such. Any imputation belongs to the modeling pipeline and must be fitted on the training fold alone. `lesionados`, `fallecidos`, `id_siniestro`, `direccion`, `hora_str`, `dia_nombre`, `fecha`, `anio` and `split_set` are not features; `tipo_siniestro`, `causa_probable` and `no_identificado` are recorded after the outcome and require ablation.
+Meteorological columns may be missing and are left as such. Any imputation belongs to the modeling pipeline and must be fitted on the training fold alone. `lesionados`, `fallecidos`, `id_siniestro`, `direccion`, `hora_str`, `dia_nombre`, `fecha`, `anio` and `split_set` are not features. The prediction moment is the occurrence of the crash: `tipo_siniestro` and the vehicle counts are recorded afterwards and enter only a dispatch-scenario sensitivity analysis (without `no_identificado`), and `causa_probable` and `codigo_causa` enter no model. In the enriched model, temperature, humidity, wind speed, solar radiation, pressure and the 3-hour temperature change enter as anomalies from the climatology of the supplying station by month and hour (`src/climatology.py`), fitted on the hourly REMMAQ series of each training fold, because station, month and hour already explain 50–99% of their variance; precipitation enters untransformed.
 
 ---
 
@@ -169,6 +170,8 @@ The suite combines synthetic tests, which run without data, and integrity tests 
 
 | File | Scope |
 |---|---|
+| `tests/test_climatology.py` | Anomalies remove the station and diurnal signal, the fit never sees years after the training window, sparse cells fall back to coarser means, missing readings stay missing. |
+| `tests/test_eda_statistics.py` | Holm step-down adjustment (monotonicity, order preservation, cap at one). |
 | `tests/test_dmq_boundary.py` | Official DMQ boundary (closure, orientation, area, stations inside, neighbouring cantonal seats outside), point-in-boundary filter and the construction of the outer boundary. |
 | `tests/test_ant_ingestion.py` | Coordinate invalidation rule, cross-month coordinate copies, categorical harmonization, synthetic-hour and clustered-coordinate flags. |
 | `tests/test_remmaq_hourly.py` | Timestamp drift tolerance, hourly convention, grid continuity, uniqueness, lag recomputation on a time basis, and the solar-radiation signature of the hour-beginning convention in every year. |
