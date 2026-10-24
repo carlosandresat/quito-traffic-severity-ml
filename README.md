@@ -82,6 +82,9 @@ quito-traffic-severity-ml/
 │   ├── ingest_remmaq.py            # REMMAQ hourly consolidation, hour convention and lag engineering
 │   ├── spatiotemporal_join.py      # Nearest-station matcher, hierarchical fallback and orographic metadata
 │   ├── climatology.py              # Station × month × hour climatology and weather anomalies (modeling)
+│   ├── features.py                 # Baseline and enriched design matrices under the variable governance
+│   ├── folds.py                    # Expanding-origin folds and holdout split (never random)
+│   ├── train_models.py             # Model training, evaluation metrics and paired bootstrap of ΔF1-macro
 │   ├── eda_statistics.py           # Hypothesis tests, odds ratios and LaTeX table export
 │   ├── eda_plots.py                # Publication figures and interactive map
 │   ├── run_eda.py                  # EDA orchestrator
@@ -141,6 +144,12 @@ Regenerate the figures and tables of `reports/` with:
 python src/run_eda.py
 ```
 
+Train and evaluate the logistic reference (baseline and enriched, weather as anomalies and as raw values) on the four expanding-origin folds; results are written to `reports/modeling/`:
+
+```bash
+python src/train_models.py
+```
+
 ### Integrated Dataset Schema
 
 `integrated_traffic_weather_quito.parquet` holds 43,244 crashes and 58 columns: crash identification and time, location and administrative context, harmonized crash typology and probable cause, victim counts and the severity target, vehicle counts by type, the meteorological vector with its lag features, and the audit columns below.
@@ -170,6 +179,7 @@ The suite combines synthetic tests, which run without data, and integrity tests 
 
 | File | Scope |
 |---|---|
+| `tests/test_modeling_design.py` | No configuration uses a forbidden column, the baseline is nested in the enriched model, cell exposure is fitted on training rows, folds never touch the test period or months without data and evaluate 1,083 fatal crashes, and the paired bootstrap behaves as expected. |
 | `tests/test_climatology.py` | Anomalies remove the station and diurnal signal, the fit never sees years after the training window, sparse cells fall back to coarser means, missing readings stay missing. |
 | `tests/test_eda_statistics.py` | Holm step-down adjustment (monotonicity, order preservation, cap at one). |
 | `tests/test_dmq_boundary.py` | Official DMQ boundary (closure, orientation, area, stations inside, neighbouring cantonal seats outside), point-in-boundary filter and the construction of the outer boundary. |
