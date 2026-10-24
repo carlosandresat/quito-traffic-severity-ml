@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from config.category_mappings import TIPO_SINIESTRO_CANONICAL
-from config.stations_config import DMQ_BOUNDING_BOX
+from config.stations_config import DMQ_BOUNDARY_PATH
 from src.ingest_ant import ANT_NATIONAL_ENTITY_PREFIXES, ANT_PASTED_COORDINATES_MONTH, MASKED_TAXONOMY_MONTH
 from src.run_pipeline import (
     CATEGORY_COLLAPSE_DOCUMENTED_EXCEPTIONS,
@@ -20,6 +20,7 @@ from src.run_pipeline import (
     verify_no_category_collapse,
 )
 from src.spatiotemporal_join import CLIMATE_ASSIGNMENT_TYPES
+from src.utils import load_boundary_rings, points_in_boundary
 
 OBSERVED_PRECURSORS = ["tmp", "hum", "vel", "dir", "pre", "rs", "lluvia_1h"]
 
@@ -118,9 +119,8 @@ def test_category_collapse_check_ignores_documented_exceptions():
 # --- Integrated dataset ---------------------------------------------------------------
 
 def test_geodetic_containment(integrated_df):
-    lat, lon = integrated_df["lat"], integrated_df["lon"]
-    assert lat.between(DMQ_BOUNDING_BOX["min_lat"], DMQ_BOUNDING_BOX["max_lat"]).all()
-    assert lon.between(DMQ_BOUNDING_BOX["min_lon"], DMQ_BOUNDING_BOX["max_lon"]).all()
+    rings = load_boundary_rings(DMQ_BOUNDARY_PATH)
+    assert points_in_boundary(integrated_df["lat"].to_numpy(), integrated_df["lon"].to_numpy(), rings).all()
 
 
 def test_severity_matches_victim_counts(integrated_df):

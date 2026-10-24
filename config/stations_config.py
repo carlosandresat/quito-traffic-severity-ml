@@ -2,8 +2,8 @@
 
 This module provides metadata, geodetic coordinates (WGS84 datum),
 and station alias mappings for the Red Metropolitana de Monitoreo
-Atmosférico de Quito (REMMAQ), alongside geographic bounding boxes
-for the Metropolitan District of Quito (DMQ).
+Atmosférico de Quito (REMMAQ), alongside the location of the official
+boundary of the Metropolitan District of Quito (DMQ).
 
 Each station also declares an orographic zone, used to audit how far a crash
 location and the station that supplied its weather differ in altitude and relief.
@@ -20,6 +20,7 @@ separated from Quito by the Pomasqui pass, so its regime follows the valleys and
 not the plateau. Altitudes are those published by the Secretaría de Ambiente.
 """
 
+from pathlib import Path
 from typing import Dict, Any, List
 
 # Official WGS84 geographic coordinates and altitudes for REMMAQ stations
@@ -117,13 +118,12 @@ STATION_ALIASES: Dict[str, str] = {
     "tumbaco": "Tumbaco"
 }
 
-# Spatial bounding box for Metropolitan District of Quito (DMQ)
-DMQ_BOUNDING_BOX: Dict[str, float] = {
-    "min_lat": -0.60,
-    "max_lat": 0.20,
-    "min_lon": -78.80,
-    "max_lon": -78.20
-}
+# Official boundary of the Metropolitan District of Quito (DMQ), in WGS84. It is
+# the outer boundary of the zonal administrations delimited by the municipality
+# (GADDMQ-SGCTGYP-2025-0799-M) and is built by src/build_dmq_boundary.py. It
+# replaces an earlier rectangular envelope that cut off the northern, western and
+# eastern rural parishes.
+DMQ_BOUNDARY_PATH: Path = Path(__file__).resolve().parent / "dmq_boundary.geojson"
 
 # Meteorological parameters monitored by REMMAQ
 METEOROLOGICAL_PARAMETERS: List[str] = [

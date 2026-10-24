@@ -5,9 +5,12 @@ This module implements vectorized orthodromic distance computations
 severity labeling for traffic accident research.
 """
 
-from typing import Dict, Any, Tuple
+import json
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
 import numpy as np
 import pandas as pd
+from matplotlib.path import Path as MplPath
 
 
 # Earth radius in kilometers (mean radius according to IUGG)
@@ -95,13 +98,71 @@ def assign_nearest_stations(
     return nearest_names, min_distances, all_distances
 
 
-def filter_spatial_bounds(
+def load_boundary_rings(geojson_path: Path) -> List[np.ndarray]:
+    """Loads the exterior rings of a (Multi)Polygon boundary stored as GeoJSON.
+
+    Parameters
+    ----------
+    geojson_path : Path
+        Path to a GeoJSON FeatureCollection with a single Polygon or
+        MultiPolygon feature in (lon, lat) WGS84 coordinates.
+
+    Returns
+    -------
+    List[np.ndarray]
+        Exterior rings as (n, 2) arrays of (lon, lat). The boundary has no
+        holes, so interior rings are rejected rather than ignored.
+    """
+    collection = json.loads(Path(geojson_path).read_text(encoding="utf-8"))
+    (feature,) = collection["features"]
+    geometry = feature["geometry"]
+    polygons = (
+        [geometry["coordinates"]] if geometry["type"] == "Polygon" else geometry["coordinates"]
+    )
+    assert all(len(polygon) == 1 for polygon in polygons), "Boundary holes are not supported"
+    return [np.asarray(polygon[0], dtype=np.float64) for polygon in polygons]
+
+
+def points_in_boundary(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    rings: List[np.ndarray]
+) -> np.ndarray:
+    """Tests which coordinates fall inside a boundary given by exterior rings.
+
+    Parameters
+    ----------
+    lats : np.ndarray
+        Latitudes in decimal degrees; NaN is treated as outside.
+    lons : np.ndarray
+        Longitudes in decimal degrees; NaN is treated as outside.
+    rings : List[np.ndarray]
+        Exterior rings of (lon, lat) vertices, as returned by `load_boundary_rings`.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask, True for points inside any ring.
+    """
+    lats = np.asarray(lats, dtype=np.float64)
+    lons = np.asarray(lons, dtype=np.float64)
+    inside = np.zeros(len(lats), dtype=bool)
+    finite = np.isfinite(lats) & np.isfinite(lons)
+    points = np.column_stack([lons[finite], lats[finite]])
+    hits = np.zeros(len(points), dtype=bool)
+    for ring in rings:
+        hits |= MplPath(ring).contains_points(points)
+    inside[finite] = hits
+    return inside
+
+
+def filter_spatial_boundary(
     df: pd.DataFrame,
     lat_col: str,
     lon_col: str,
-    bbox: Dict[str, float]
+    rings: List[np.ndarray]
 ) -> pd.DataFrame:
-    """Filters dataframe rows strictly to geographic bounding box boundaries.
+    """Filters dataframe rows to those located inside a polygonal boundary.
 
     Parameters
     ----------
@@ -111,21 +172,17 @@ def filter_spatial_bounds(
         Name of the latitude column.
     lon_col : str
         Name of the longitude column.
-    bbox : Dict[str, float]
-        Dictionary with keys 'min_lat', 'max_lat', 'min_lon', 'max_lon'.
+    rings : List[np.ndarray]
+        Exterior rings of the boundary, as returned by `load_boundary_rings`.
 
     Returns
     -------
     pd.DataFrame
-        Subset of rows located within the spatial boundaries.
+        Subset of rows located inside the boundary; rows without coordinates
+        are dropped.
     """
-    valid_mask = (
-        (df[lat_col] >= bbox["min_lat"])
-        & (df[lat_col] <= bbox["max_lat"])
-        & (df[lon_col] >= bbox["min_lon"])
-        & (df[lon_col] <= bbox["max_lon"])
-    )
-    return df[valid_mask].copy()
+    mask = points_in_boundary(df[lat_col].to_numpy(), df[lon_col].to_numpy(), rings)
+    return df[mask].copy()
 
 
 def derive_severity_label(deceased_counts: pd.Series, injured_counts: pd.Series) -> pd.Series:

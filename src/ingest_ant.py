@@ -26,8 +26,8 @@ from config.category_mappings import (
     PARROQUIA_CANONICAL,
     TIPO_SINIESTRO_CANONICAL,
 )
-from config.stations_config import DMQ_BOUNDING_BOX
-from src.utils import filter_spatial_bounds, derive_severity_label
+from config.stations_config import DMQ_BOUNDARY_PATH
+from src.utils import derive_severity_label, filter_spatial_boundary, load_boundary_rings
 
 
 # Canonical source columns read from every file. PERIODO_2 is read only to verify
@@ -551,8 +551,10 @@ def standardize_ant_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     out["lat"] = pd.to_numeric(df["LATITUD_Y"], errors="coerce")
     out["lon"] = pd.to_numeric(df["LONGITUD_X"], errors="coerce")
 
-    # Spatial bounds filtering
-    out = filter_spatial_bounds(out, lat_col="lat", lon_col="lon", bbox=DMQ_BOUNDING_BOX)
+    # Spatial filtering to the official DMQ boundary
+    out = filter_spatial_boundary(
+        out, lat_col="lat", lon_col="lon", rings=load_boundary_rings(DMQ_BOUNDARY_PATH)
+    )
 
     # Re-index original slice matching spatial filter
     df = df.loc[out.index].copy()
@@ -665,7 +667,7 @@ def run_ant_ingestion(
     combined_raw = pd.concat(frames, ignore_index=True)
     print(f"    Total uncurated Quito records extracted: {len(combined_raw):,}")
 
-    print("[x] Standardizing schema and filtering DMQ bounding box...")
+    print("[x] Standardizing schema and filtering to the official DMQ boundary...")
     clean_df = standardize_ant_dataframe(combined_raw)
     print(f"    Total standardized crash observations: {len(clean_df):,}")
 

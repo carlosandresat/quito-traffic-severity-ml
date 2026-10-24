@@ -19,11 +19,12 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from config.stations_config import (
-    DMQ_BOUNDING_BOX,
+    DMQ_BOUNDARY_PATH,
     OROGRAPHIC_ZONES,
     REMMAQ_STATIONS,
     SEVERITY_LEVELS,
 )
+from src.utils import load_boundary_rings, points_in_boundary
 from src.ingest_ant import run_ant_ingestion
 from src.ingest_remmaq import run_remmaq_ingestion
 from src.spatiotemporal_join import (
@@ -241,11 +242,11 @@ def verify_integrated_dataset(df: pd.DataFrame) -> bool:
     print("=" * 70)
 
     # 1. Geodetic spatial containment
-    assert (df["lat"] >= DMQ_BOUNDING_BOX["min_lat"]).all(), "Error: Latitude below DMQ minimum"
-    assert (df["lat"] <= DMQ_BOUNDING_BOX["max_lat"]).all(), "Error: Latitude above DMQ maximum"
-    assert (df["lon"] >= DMQ_BOUNDING_BOX["min_lon"]).all(), "Error: Longitude below DMQ minimum"
-    assert (df["lon"] <= DMQ_BOUNDING_BOX["max_lon"]).all(), "Error: Longitude above DMQ maximum"
-    print("[x] Geodetic containment: 100% of observations fall strictly inside DMQ boundaries.")
+    inside = points_in_boundary(
+        df["lat"].to_numpy(), df["lon"].to_numpy(), load_boundary_rings(DMQ_BOUNDARY_PATH)
+    )
+    assert inside.all(), f"Error: {int((~inside).sum())} observations fall outside the DMQ boundary"
+    print("[x] Geodetic containment: 100% of observations fall inside the official DMQ boundary.")
 
     # 2. Target variable consistency
     assert set(df["severidad"].unique()).issubset({0, 1, 2}), "Error: Invalid severity class detected"

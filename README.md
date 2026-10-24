@@ -10,10 +10,10 @@ A reproducible, data integration pipeline combining geolocated traffic accident 
 
 ## 1. Overview and Scientific Motivation
 
-Predicting the severity of road traffic collisions conditioned on instantaneous and antecedent meteorological factors is critical for proactive urban road safety management. While prior research in Ecuador predominantly relied on aggregated cantonal statistics without geodetic references, this repository implements a fine-grained spatiotemporal matching engine connecting **43,234 geolocated crash events (2017–2026)** to the nearest official atmospheric monitoring stations using orthodromic Haversine distances.
+Predicting the severity of road traffic collisions conditioned on instantaneous and antecedent meteorological factors is critical for proactive urban road safety management. While prior research in Ecuador predominantly relied on aggregated cantonal statistics without geodetic references, this repository implements a fine-grained spatiotemporal matching engine connecting **43,244 geolocated crash events (2017–2026)** to the nearest official atmospheric monitoring stations using orthodromic Haversine distances.
 
 ### Key Highlights
-- **Geographic Precision:** 100% of analyzed crashes carry verified WGS84 coordinates inside the DMQ spatial domain (mean distance to the station that supplied the weather: $3.25\text{ km}$, median: $2.76\text{ km}$, 90th percentile: $5.42\text{ km}$).
+- **Geographic Precision:** 100% of analyzed crashes carry verified WGS84 coordinates inside the official DMQ boundary (mean distance to the station that supplied the weather: $3.26\text{ km}$, median: $2.76\text{ km}$, 90th percentile: $5.42\text{ km}$).
 - **Validated Atmospheric Series:** Meteorological variables are sourced strictly from QA/QC-controlled observations validated under WHO, US-EPA, and WMO-GAW protocols.
 - **Hydrological Lag Covariates:** Incorporates rolling precipitation accumulations ($3\text{h}$ and $6\text{h}$) and thermal gradient indicators ($\Delta T_{3\text{h}}$) as physical proxies for surface friction and cold front passages.
 - **Observed Values Only:** Missing meteorological readings are preserved as missing. No imputation is performed in the data layer, and every crash declares how its weather was assigned (`asignacion_clima`) and how many variables are absent (`n_variables_clima_faltantes`).
@@ -35,12 +35,12 @@ $$\text{SEVERIDAD} = \begin{cases}
 ### Empirical Class Distribution (DMQ, 2017–2026)
 | Class | Category | Observations | Proportion |
 |---|---|---|---|
-| **0** | Property Damage Only | 22,794 | 52.72% |
-| **1** | Non-Fatal Injuries | 18,063 | 41.78% |
+| **0** | Property Damage Only | 22,799 | 52.72% |
+| **1** | Non-Fatal Injuries | 18,068 | 41.78% |
 | **2** | Fatal Crash | 2,377 | 5.50% |
-| **Total** | **Unified Sample** | **43,234** | **100.00%** |
+| **Total** | **Unified Sample** | **43,244** | **100.00%** |
 
-Partitions: `train` 2017–2024 (36,891 crashes, 5.12% fatal), `val` 2025 (3,987, 7.90%) and `test` January–July 2026 (2,356, 7.39%). The fatal share is not stable across the study period; see Section 8.
+Partitions: `train` 2017–2024 (36,901 crashes, 5.12% fatal), `val` 2025 (3,987, 7.88%) and `test` January–July 2026 (2,356, 7.39%). The fatal share is not stable across the study period; see Section 8.
 
 ---
 
@@ -56,6 +56,10 @@ Partitions: `train` 2017–2024 (36,891 crashes, 5.12% fatal), `val` 2025 (3,987
 - **Monitoring Stations (9):** `Belisario`, `Carapungo`, `Centro`, `Cotocollao`, `El Camal`, `Guamaní`, `Los Chillos`, `San Antonio`, `Tumbaco`.
 - **Monitored Parameters:** Air Temperature (`TMP`, °C), Precipitation (`LLU`, mm/h), Relative Humidity (`HUM`, %), Wind Speed (`VEL`, m/s), Wind Direction (`DIR`, °), Surface Pressure (`PRE`, hPa), and Solar Radiation (`RS`, W/m²).
 
+### 3.3 Study Area Boundary
+- **Source:** Secretaría General de Coordinación Territorial, Gobernabilidad y Participación, GAD del Distrito Metropolitano de Quito, through the Geoportal Metropolitano de Quito: *Delimitación de las Administraciones Zonales* (made official by memorandum GADDMQ-SGCTGYP-2025-0799-M; September 2025 release).
+- **Derivation:** The outer boundary of the ten zonal administrations, which partition the district, simplified to about 1 m and versioned as `config/dmq_boundary.geojson` (4,215 km²). The rural parish layer of the same portal yields the same outline. Rebuild with `python src/build_dmq_boundary.py` only if a new delimitation is published.
+
 ---
 
 ## 4. Repository Architecture
@@ -67,11 +71,13 @@ quito-traffic-severity-ml/
 ├── requirements.txt                # Reproducible dependency specifications
 ├── config/
 │   ├── __init__.py
-│   ├── stations_config.py          # REMMAQ coordinates, altitudes, orographic zones, aliases, spatial bounds
+│   ├── stations_config.py          # REMMAQ coordinates, altitudes, orographic zones, aliases, boundary path
+│   ├── dmq_boundary.geojson        # Official DMQ boundary (WGS84), built by src/build_dmq_boundary.py
 │   └── category_mappings.py        # Canonical ANT crash types, cause texts and parish names
 ├── src/
 │   ├── __init__.py
-│   ├── utils.py                    # Vectorized Haversine metric and geodetic validation
+│   ├── utils.py                    # Vectorized Haversine metric and point-in-boundary filter
+│   ├── build_dmq_boundary.py       # Derives the DMQ boundary from the municipal zonal administrations
 │   ├── ingest_ant.py               # ANT crash homogenization, source-defect rules and quality flags
 │   ├── ingest_remmaq.py            # REMMAQ hourly consolidation, hour convention and lag engineering
 │   ├── spatiotemporal_join.py      # Nearest-station matcher, hierarchical fallback and orographic metadata
@@ -85,7 +91,8 @@ quito-traffic-severity-ml/
 └── data/                           # Ignored by Git (data privacy policy)
     ├── raw/                        # Raw source datasets (local copies)
     │   ├── transito/ANT/           # ANT crash datasets (CSV 2017–2023, XLSX 2024, 2025, 2026)
-    │   └── clima/REMMAQ/           # REMMAQ validated hourly meteorological workbooks
+    │   ├── clima/REMMAQ/           # REMMAQ validated hourly meteorological workbooks
+    │   └── limites/                # Municipal boundary layers (only needed to rebuild the boundary)
     └── processed/                  # Generated Parquet and CSV research matrices
 ```
 
@@ -122,7 +129,7 @@ python src/run_pipeline.py
 ```
 
 ### Pipeline Execution Flow
-1. **`ingest_ant.py`:** Ingests CSV (2017–2023) and cumulative annual XLSX (2024, 2025, 2026), voids the December 2024 coordinates copied from January 2024, standardizes the schema, filters the DMQ bounding box, harmonizes categorical taxonomies, flags clustered geocoding and synthetic hours, and saves `ant_accidents_quito_unified.parquet`.
+1. **`ingest_ant.py`:** Ingests CSV (2017–2023) and cumulative annual XLSX (2024, 2025, 2026), voids the December 2024 coordinates copied from January 2024, standardizes the schema, keeps the crashes located inside the official DMQ boundary, harmonizes categorical taxonomies, flags clustered geocoding and synthetic hours, and saves `ant_accidents_quito_unified.parquet`.
 2. **`ingest_remmaq.py`:** Reads QA/QC-validated parameters, snaps drifting timestamps to the hour, harmonizes the hourly convention, reshapes into long format on a continuous hourly grid per station, computes rolling lag variables, and saves `remmaq_meteorology_hourly.parquet` (755,784 station-hours, 2017-01-01 to 2026-07-31).
 3. **`spatiotemporal_join.py`:** Assigns the nearest REMMAQ station by Haversine distance, applies hierarchical spatial fallback for sensor outages without imputing missing readings, records the altitude and orographic zone of the station used, assigns temporal splits, and exports `integrated_traffic_weather_quito.parquet`.
 4. **`verify_integrated_dataset`:** Asserts geodetic containment, the severity identity, physical bounds of observed readings, partition isolation, climate assignment consistency, the quality and orographic columns, monthly record volume and annual climate coverage.
@@ -135,11 +142,11 @@ python src/run_eda.py
 
 ### Integrated Dataset Schema
 
-`integrated_traffic_weather_quito.parquet` holds 43,234 crashes and 58 columns: crash identification and time, location and administrative context, harmonized crash typology and probable cause, victim counts and the severity target, vehicle counts by type, the meteorological vector with its lag features, and the audit columns below.
+`integrated_traffic_weather_quito.parquet` holds 43,244 crashes and 58 columns: crash identification and time, location and administrative context, harmonized crash typology and probable cause, victim counts and the severity target, vehicle counts by type, the meteorological vector with its lag features, and the audit columns below.
 
 | Column | Meaning |
 |---|---|
-| `asignacion_clima` | `directa` when the geographically nearest station reported both temperature and precipitation for that hour (89.24% of crashes), `fallback` when another station did (10.74%), `sin_dato` when none did (0.01%). |
+| `asignacion_clima` | `directa` when the geographically nearest station reported both temperature and precipitation for that hour (89.25% of crashes), `fallback` when another station did (10.74%), `sin_dato` when none did (0.01%). |
 | `n_variables_clima_faltantes` | Number of the seven measured variables missing from the assigned vector (0–7). |
 | `estacion_geografica_mas_cercana`, `distancia_geografica_mas_cercana_km` | Nearest station and its distance, always. |
 | `estacion_climatica_utilizada`, `distancia_climatica_utilizada_km` | Station that supplied the vector and its distance. |
@@ -162,6 +169,7 @@ The suite combines synthetic tests, which run without data, and integrity tests 
 
 | File | Scope |
 |---|---|
+| `tests/test_dmq_boundary.py` | Official DMQ boundary (closure, orientation, area, stations inside, neighbouring cantonal seats outside), point-in-boundary filter and the construction of the outer boundary. |
 | `tests/test_ant_ingestion.py` | Coordinate invalidation rule, cross-month coordinate copies, categorical harmonization, synthetic-hour and clustered-coordinate flags. |
 | `tests/test_remmaq_hourly.py` | Timestamp drift tolerance, hourly convention, grid continuity, uniqueness, lag recomputation on a time basis, and the solar-radiation signature of the hour-beginning convention in every year. |
 | `tests/test_spatiotemporal_join.py` | Lookup keys and hourly offset, matching a crash to the mark of its own hour, orographic metadata. |
@@ -177,6 +185,7 @@ These defects belong to the published sources, not to the pipeline. Each one is 
 - **Undocumented and non-constant hourly convention.** The provider does not state whether a mark denotes the hour that begins or the hour that ends. The diurnal cycle of solar radiation, corroborated by temperature, humidity, wind, pressure and precipitation, shows that marks before 2019-06-18 summarize the preceding hour, while later marks summarize the following one. Earlier marks are relabelled one hour back, so the series follows a single hour-beginning convention; the hour lost by the source at the change remains missing. This is an empirical inference, not a statement by the provider.
 - **December 2024 coordinates.** In the 2024 workbook, the December block of the municipal agencies carries the coordinates of the first 827 January records; the originals are not available in any published source. Those coordinates are voided before the spatial filter, so December 2024 keeps only the 14 national police records and must be treated as a month without valid georeferencing, like October to December 2023.
 - **Floating-point hours in the 2024 workbook.** In 142 Quito records of the 2024 workbook the hour disagrees with the hourly period (`PERIODO_2`) published in the same row: 140 store the time as `HH:59:59.9xx`, the floating-point representation of the following full hour, and 2 use an `HHhMM` layout. Hours are rounded to the second before the hour is extracted, the `HHhMM` layout is parsed, and every run asserts that each readable hour falls in its published period.
+- **Coordinates outside the district.** Some crashes the source attributes to the Quito canton carry coordinates in other cantons or provinces, a georeferencing error. Only crashes inside the official DMQ boundary are kept. Compared with the rectangular envelope used before, the boundary recovers 11 crashes in the northern and western rural parishes (San José de Minas, Pacto, Gualea) and in El Quinche and Pifo, and drops 1 crash located about 10 km outside the district.
 - **Station outages.** Centro was not operating in 2017–2018, El Camal reports almost nothing in 2023–2024 and again in June–July 2026, and Guamaní falls to 46% in 2025 and 0% in 2026. Outages raise the share of fallback assignments rather than leaving crashes without weather, and the altitude difference of each assignment is recorded.
 - **Source-period taxonomies.** The 2017–2023 CSV writes categories without accents and with the digraph 'NI' for 'Ñ'. Explicit lookup tables map every observed value to the spelling published in the 2024–2026 workbooks.
 - **Centroid geocoding.** 40.6% of crashes share an exact coordinate with another crash, a by-product of geocoding to administrative centroids that collapses after April 2022 and is more frequent among non-fatal crashes. Raw coordinates are therefore not suitable as model features; `coordenada_agrupada` supports stratified sensitivity analyses.
