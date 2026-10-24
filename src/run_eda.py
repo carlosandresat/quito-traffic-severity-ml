@@ -24,7 +24,8 @@ from src.eda_statistics import (
     compute_kruskal_wallis_tests,
     compute_odds_ratio,
     compute_contingency_chi2,
-    format_latex_table
+    format_latex_table,
+    holm_adjust
 )
 from src.eda_plots import (
     plot_fig1_severity_temporal_trends,
@@ -118,7 +119,10 @@ def main():
     # Table 3: Odds Ratios for Environmental and Operational Factors
     df_temp = build_binary_risk_factors(df)
     or_results = [compute_odds_ratio(df_temp, rf, target_class=2) for rf, _ in RISK_FACTORS]
-    table3 = pd.DataFrame(or_results)
+    # The factors form one family of tests: significance is read on Holm-adjusted p-values.
+    table3 = pd.DataFrame(or_results).drop(columns="Significant")
+    table3["p_value_holm"] = holm_adjust(table3["p_value"].to_numpy())
+    table3["Significant_Holm"] = table3["p_value_holm"] < 0.05
     table3.to_csv(tab_dir / "table3_odds_ratios_risk_factors.csv", index=False)
     (tab_dir / "table3_odds_ratios_risk_factors.tex").write_text(
         format_latex_table(table3, "Odds Ratios for Fatal Collision Risk Across Environmental, Temporal, and Vehicular Factors", "tab:odds_ratios"),

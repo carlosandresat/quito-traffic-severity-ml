@@ -161,19 +161,36 @@ def compute_kruskal_wallis_tests(
 
     out_df = pd.DataFrame(results)
     if not out_df.empty:
-        # Holm-Bonferroni correction
-        p_arr = out_df["p_value_raw"].to_numpy()
-        order = np.argsort(p_arr)
-        adj_p = np.empty_like(p_arr)
-        m = len(p_arr)
-
-        for rank, idx in enumerate(order):
-            adj_p[idx] = min(1.0, p_arr[idx] * (m - rank))
-
-        out_df["p_value_adjusted"] = adj_p
+        out_df["p_value_adjusted"] = holm_adjust(out_df["p_value_raw"].to_numpy())
         out_df["Significant_at_05"] = out_df["p_value_adjusted"] < 0.05
 
     return out_df
+
+
+def holm_adjust(p_values: np.ndarray) -> np.ndarray:
+    """Adjusts a family of p-values with the Holm step-down procedure.
+
+    The i-th smallest p-value is multiplied by (m - i + 1), and the running
+    maximum is taken along the sorted order so that adjusted p-values never
+    decrease as the raw ones increase (Holm, 1979).
+
+    Parameters
+    ----------
+    p_values : np.ndarray
+        Raw p-values of the tests in the family.
+
+    Returns
+    -------
+    np.ndarray
+        Holm-adjusted p-values, capped at 1, in the original order.
+    """
+    p = np.asarray(p_values, dtype=float)
+    m = len(p)
+    order = np.argsort(p)
+    stepped = np.maximum.accumulate((m - np.arange(m)) * p[order])
+    adjusted = np.empty(m)
+    adjusted[order] = np.minimum(1.0, stepped)
+    return adjusted
 
 
 def compute_odds_ratio(
