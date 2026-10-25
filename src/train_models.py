@@ -584,7 +584,8 @@ def run_metadata(config: ExperimentConfig, inputs: List[Path], started: float, f
         "search_spaces": SEARCH_SPACES,
         "fixed_threads": {"xgboost": XGBOOST_N_THREADS, "random_forest_predict": 1},
         "git_commit": git("rev-parse", "HEAD"),
-        "git_dirty": bool(git("status", "--porcelain")),
+        # Only tracked files count: result files written by a parallel run are untracked.
+        "git_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
         "python": platform.python_version(),
         "packages": {"numpy": np.__version__, "pandas": pd.__version__,
                      "scikit-learn": sklearn.__version__, "xgboost": xgb.__version__,
