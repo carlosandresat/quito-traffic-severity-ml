@@ -6,7 +6,7 @@
 
 A reproducible, data integration pipeline combining geolocated traffic accident records from the **Agencia Nacional de Tránsito (ANT)** with high-resolution hourly meteorological observations from the **Red Metropolitana de Monitoreo Atmosférico de Quito (REMMAQ)** across the Metropolitan District of Quito (DMQ), Ecuador.
 
-**Authors:** Carlos Andrés Arévalo Torres , Marcela Azucena Venegas Espinosa, Nombre Apellido¹, Nombre Apellido¹
+**Authors:** Carlos Andrés Arévalo Torres , Marcela Azucena Venegas Espinosa, Johana Katerine Erazo Enriquez, Nombre Apellido¹
 ¹ Maestría en Ciencia de Datos y Máquinas de Aprendizaje con Mención en Inteligencia Artificial, Universidad Internacional del Ecuador (UIDE).
 **Supervisor:** Mgtr. María del Carmen
 ---
