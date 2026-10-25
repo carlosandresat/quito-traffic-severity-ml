@@ -144,11 +144,14 @@ Regenerate the figures and tables of `reports/` with:
 python src/run_eda.py
 ```
 
-Train and evaluate the logistic reference (baseline and enriched, weather as anomalies and as raw values) on the four expanding-origin folds; results are written to `reports/modeling/`:
+Train and evaluate the multinomial logistic regression, Random Forest, XGBoost and LightGBM, each in the baseline and enriched configurations, on the four expanding-origin folds. For each learner and fold, one hyperparameter set is chosen for both configurations by its mean macro F1 on the last training year, so that the contrast is not confounded by model selection. Per-fold metrics (macro F1, per-class recall and F1, PR-AUC, log loss, Brier), the paired bootstrap of ΔF1-macro per fold and pooled over folds, the score of every tuning candidate and a run metadata file (code version, package versions, budget, seed, hardware, input hashes, run time) are written to `reports/modeling/`; evaluation probabilities go to `data/modeling/`:
 
 ```bash
-python src/train_models.py
+python src/train_models.py                                   # study defaults, weather as anomalies
+python src/train_models.py --models lightgbm --raw-weather   # sensitivity with raw weather
 ```
+
+Results do not depend on the hardware. The tuning budget (`--n-candidates`, default 12) and the bootstrap replicates (`--bootstrap`, default 2,000) are parameters of the study, all randomness is seeded, LightGBM runs in deterministic mode, XGBoost uses a fixed number of threads because its subsampling depends on it, and Random Forest predicts on one thread. A faster machine runs the same experiment in less time.
 
 ### Integrated Dataset Schema
 
