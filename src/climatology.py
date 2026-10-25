@@ -1,7 +1,7 @@
 """Station climatology and meteorological anomalies for the enriched model.
 
 Most of the variance of the measured meteorological variables is determined by
-where and when a crash happens. Over the 2019–2024 training window, station ×
+where and when a crash happens. Over the crashes of 2019–2024, station ×
 month × hour explains 77–81% of the variance of temperature, solar radiation and
 the 3-hour temperature change, 64% of humidity, 50% of wind speed and 99% of
 pressure, whereas precipitation is almost entirely departure from that mean. The

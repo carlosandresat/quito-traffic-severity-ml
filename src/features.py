@@ -11,11 +11,28 @@ occurrence of the crash, so only information known at that instant enters:
   humidity, wind speed, solar radiation, pressure and the 3-hour temperature
   change enter as anomalies from the station climatology (``src.climatology``);
   precipitation enters untransformed and wind direction as sine and cosine.
-  The distance to the station that supplied the weather enters only alongside
-  the distance to the nearest station.
+
+The weather is that of the hourly mark before the crash hour, at the station
+that supplied the crash weather (``previous_hour_weather``). Since the hourly
+convention is hour-beginning, the mark of the crash hour summarizes the hour
+that starts then, most of it after the crash; the previous mark ends when the
+crash hour begins, so it is known at the prediction moment. On the validation
+years it lost no information against the crash-hour mark. The crash-hour
+weather is a sensitivity analysis.
 
 No climate-quality indicator, post-event field (crash type, vehicles, cause) or
-victim count is ever a feature. Everything that depends on data (cell exposure,
+victim count is ever a feature. The distance to the station that supplied the
+weather is excluded too: together with the distance to the nearest station it
+reconstructs the fallback flag exactly (their difference is at most 0.001 km
+for every direct assignment and at least 0.002 km for every fallback).
+
+Missing weather values are imputed at the climatology of the fold, so that no
+learner sees a missing-value pattern: anomalies take 0 (raw values take the
+climatological mean of their station, month and hour), precipitation takes 0
+(its training median) and wind direction takes the origin of its sine and
+cosine. A missing value marks a sensor outage, not the weather, and its
+pattern also marks periods: 1,983 of the 2,015 missing humidity readings are
+Cotocollao's in 2017-2018. Everything that depends on data (cell exposure,
 climatology) is fitted on the training rows of each fold.
 """
 
@@ -24,7 +41,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from src.climatology import ANOMALY_SUFFIX, StationClimatology
+from src.climatology import ANOMALY_SUFFIX, CLIMATOLOGY_VARIABLES, StationClimatology
 
 CELL_SIDE_KM: float = 5.0
 EXPOSURE_CELL_SIDE_KM: float = 2.0
@@ -45,8 +62,13 @@ WEATHER_ANOMALIES: List[str] = [
 WEATHER_RAW: List[str] = ["tmp", "hum", "vel", "rs", "pre", "temp_delta_3h"]
 WEATHER_COMMON: List[str] = [
     "dir_sin", "dir_cos", "lluvia_1h", "lluvia_flag", "lluvia_acum_3h", "lluvia_acum_6h",
-    "distancia_climatica_utilizada_km",
 ]
+PRECIPITATION: List[str] = ["lluvia_1h", "lluvia_flag", "lluvia_acum_3h", "lluvia_acum_6h"]
+WEATHER_SOURCE: List[str] = CLIMATOLOGY_VARIABLES + ["dir"] + PRECIPITATION
+
+# Columns with the month and hour of the weather mark, the keys of the
+# climatology when the weather is not that of the crash hour.
+CLIMATE_MONTH, CLIMATE_HOUR = "mes_clima", "hora_clima"
 
 # Reduced weather block for the multinomial logistic regression: the collinear
 # precipitation pair keeps 'lluvia_acum_3h', and solar radiation, a proxy of the
@@ -123,6 +145,38 @@ def feature_columns(config: str, model: str = "tree", raw_weather: bool = False)
     return {"numeric": numeric, "categorical": list(BASE_CATEGORICAL)}
 
 
+def previous_hour_weather(df: pd.DataFrame, hourly: pd.DataFrame) -> pd.DataFrame:
+    """Crashes with the weather of the previous hourly mark of the same station.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Integrated dataset (crash-hour weather and 'estacion_climatica_utilizada').
+    hourly : pd.DataFrame
+        Hourly REMMAQ grid with 'estacion', 'fecha_hora' and the weather columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of ``df`` whose weather columns hold the values of the mark one hour
+        before the crash hour at the station that supplied the crash weather
+        (missing if that hour is missing there), plus the month and hour of that
+        mark in ``CLIMATE_MONTH`` and ``CLIMATE_HOUR``.
+    """
+    mark = (pd.to_datetime(df["fecha"]).dt.normalize() + pd.to_timedelta(df["hora"], unit="h")
+            - pd.Timedelta(hours=1))
+    key = pd.MultiIndex.from_arrays([df["estacion_climatica_utilizada"].astype(str), mark])
+    table = hourly.assign(fecha_hora=pd.to_datetime(hourly["fecha_hora"])).set_index(
+        ["estacion", "fecha_hora"])[WEATHER_SOURCE]
+    out = df.copy()
+    previous = table.reindex(key)
+    for col in WEATHER_SOURCE:
+        out[col] = previous[col].astype("float64").to_numpy()
+    out[CLIMATE_MONTH] = mark.dt.month.to_numpy()
+    out[CLIMATE_HOUR] = mark.dt.hour.to_numpy()
+    return out
+
+
 def build_feature_frame(
     df: pd.DataFrame,
     train_mask: pd.Series,
@@ -133,12 +187,14 @@ def build_feature_frame(
     Parameters
     ----------
     df : pd.DataFrame
-        Integrated dataset.
+        Integrated dataset, usually after ``previous_hour_weather``; the
+        climatology keys are its ``CLIMATE_MONTH`` and ``CLIMATE_HOUR`` columns
+        when present and the crash month and hour otherwise.
     train_mask : pd.Series
         Boolean mask of the training rows of the fold.
     climatology : Optional[StationClimatology]
         Climatology fitted on the training years of the fold; required for the
-        weather anomalies.
+        weather anomalies and for imputing missing weather values.
 
     Returns
     -------
@@ -165,12 +221,16 @@ def build_feature_frame(
     for var in WEATHER_RAW:
         out[var] = df[var].astype(float)
     if climatology is not None:
-        out = out.join(climatology.anomalies(df))
-    out["dir_sin"] = np.sin(np.deg2rad(df["dir"].astype(float)))
-    out["dir_cos"] = np.cos(np.deg2rad(df["dir"].astype(float)))
-    for var in ["lluvia_1h", "lluvia_acum_3h", "lluvia_acum_6h", "distancia_climatica_utilizada_km"]:
-        out[var] = df[var].astype(float)
-    out["lluvia_flag"] = df["lluvia_flag"].astype(float)
+        month_col = CLIMATE_MONTH if CLIMATE_MONTH in df else "mes"
+        hour_col = CLIMATE_HOUR if CLIMATE_HOUR in df else "hora"
+        out = out.join(climatology.anomalies(df, month_col=month_col, hour_col=hour_col).fillna(0.0))
+        for var in climatology.variables:
+            expected = climatology.expected(var, df["estacion_climatica_utilizada"], df[month_col], df[hour_col])
+            out[var] = out[var].fillna(pd.Series(expected, index=df.index))
+    out["dir_sin"] = np.sin(np.deg2rad(df["dir"].astype(float))).fillna(0.0)
+    out["dir_cos"] = np.cos(np.deg2rad(df["dir"].astype(float))).fillna(0.0)
+    for var in PRECIPITATION:
+        out[var] = df[var].astype(float).fillna(0.0)
 
     out["ente_control"] = control_entity(df["id_siniestro"])
     out[TARGET] = df[TARGET].astype(int)
