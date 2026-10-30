@@ -902,7 +902,7 @@ def main(
         for name, table in contrast.items():
             table.to_csv(report_dir / f"contrast_{name}_{config.label}.csv", index=False)
         print("\n=== Confirmatory contrast ===")
-        print(contrast["selection"].drop(columns="params").to_string(index=False))
+        print(contrast["selection"].to_string(index=False))
         print(contrast["primary"].round(4).to_string(index=False))
         print(contrast["secondary"].round(4).to_string(index=False))
         results["contrast"] = contrast

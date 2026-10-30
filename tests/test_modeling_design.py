@@ -30,6 +30,7 @@ from src.train_models import (
     selected_candidates,
     weighted_average_precision,
 )
+from src.train_models import main as train_main
 
 NEVER_FEATURES = {
     "lesionados", "fallecidos", "severidad", "id_siniestro", "direccion", "hora_str",
@@ -313,6 +314,8 @@ def test_contrast_selects_the_learner_on_validation_only(tmp_path):
     secondary = out["secondary"].set_index("model")
     assert secondary.loc["logistic", "delta_f1_macro"] > 0.5
     assert (secondary["delta_f1_macro_p_holm"] >= secondary["delta_f1_macro_p_value"]).all()
+    summary = train_main(config, report_dir=tmp_path, prediction_dir=tmp_path, summarize_only=True)
+    assert "contrast" in summary and (tmp_path / f"contrast_primary_{config.label}.csv").exists()
 
 
 def test_shared_and_independent_hyperparameter_selection():
