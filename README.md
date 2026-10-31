@@ -158,6 +158,9 @@ python src/train_models.py --first-train-year 2019           # sensitivity windo
 python src/train_models.py --first-train-year 2022           # sensitivity window 2022-2024 (folds on 2024 and 2025)
 python src/train_models.py --independent-hyperparameters     # sensitivity: each configuration keeps its own candidate
 python src/train_models.py --crash-hour-weather              # sensitivity: weather of the crash-hour mark
+python src/train_models.py --dispatch-scenario               # sensitivity: crash type and vehicle counts in both configurations
+python src/train_models.py --direct-assignment-only          # sensitivity: only crashes with a direct weather assignment
+python src/train_models.py --smote-nc                        # sensitivity: SMOTE-NC on the fit rows instead of class weights
 python src/train_models.py --summarize-only                  # contrast from saved results
 ```
 

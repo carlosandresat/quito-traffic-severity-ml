@@ -1,7 +1,10 @@
 """Tests for the modeling design: feature governance, folds and the paired bootstrap."""
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.climatology import CLIMATOLOGY_VARIABLES, StationClimatology
 from src.features import (
@@ -9,6 +12,7 @@ from src.features import (
     BASE_NUMERIC,
     CLIMATE_HOUR,
     CLIMATE_MONTH,
+    VEHICLE_COUNTS,
     WEATHER_SOURCE,
     build_feature_frame,
     control_entity,
@@ -25,9 +29,11 @@ from src.train_models import (
     candidate_params,
     confirmatory_contrast,
     contrast_reading,
+    fold_frames,
     pooled_bootstrap_contrast,
     run_metadata,
     selected_candidates,
+    smote_nc_resample,
     weighted_average_precision,
 )
 from src.train_models import main as train_main
@@ -66,6 +72,34 @@ def test_logistic_drops_the_redundant_weather_columns():
     numeric = feature_columns("enriched", model="logistic")["numeric"]
     assert "lluvia_acum_6h" not in numeric and "rs_anom" not in numeric
     assert "lluvia_acum_3h" in numeric
+
+
+def test_dispatch_scenario_adds_the_event_fields_to_both_configurations_only():
+    for config in ("base", "enriched"):
+        for model in ("tree", "logistic"):
+            main_design = feature_columns(config, model=model)
+            cols = feature_columns(config, model=model, dispatch=True)
+            added = set(cols["numeric"] + cols["categorical"]) - set(main_design["numeric"] + main_design["categorical"])
+            assert added >= {"tipo_siniestro", "automovil", "motocicleta"}
+            assert not {"no_identificado", "suma_de_vehiculos", "causa_probable", "codigo_causa"} & added
+            assert ("vehiculos_identificados" in added) == (model == "tree")
+
+
+def test_dispatch_sum_cannot_reconstruct_unidentified_vehicles():
+    n = 4
+    df = pd.DataFrame({
+        "hora": 8, "mes": 1, "dia_semana": 1, "es_feriado": 0, "periodo_movilidad": "x",
+        "lat": -0.2, "lon": -78.5, "estacion_geografica_mas_cercana": "Centro",
+        "distancia_geografica_mas_cercana_km": 1.0, "estacion_climatica_utilizada": "Centro",
+        **{v: 20.0 for v in WEATHER_SOURCE}, "dir": 90.0, "id_siniestro": "DMQ1", "severidad": 0,
+        "tipo_siniestro": ["OTROS", None, "OTROS", "OTROS"], "no_identificado": [0, 1, 2, 3],
+        **{v: 0 for v in VEHICLE_COUNTS}, "suma_de_vehiculos": [1, 2, 3, 4],
+    }, index=range(n))
+    df["automovil"] = 1
+    frame = build_feature_frame(df, pd.Series(True, index=df.index), dispatch=True)
+    assert frame["vehiculos_identificados"].tolist() == [1.0] * n
+    assert frame["tipo_siniestro"].isna().tolist() == [False, True, False, False]
+    assert "tipo_siniestro" not in build_feature_frame(df, pd.Series(True, index=df.index))
 
 
 def test_control_entity_from_identifier_prefix():
@@ -334,6 +368,57 @@ def test_class_weighting_sets_the_effective_prior():
     unweighted = SeverityModel("lightgbm", {**params, "class_weight": None}, ["x"], ["cell"]).fit(train, y)
     assert np.allclose(balanced.effective_prior_, 1 / 3)
     assert np.allclose(unweighted.effective_prior_, np.bincount(y, minlength=3) / len(y))
+
+
+def _resampling_frame(n: int = 400) -> pd.DataFrame:
+    rng = np.random.default_rng(3)
+    day = rng.integers(1, 8, n)
+    return pd.DataFrame({
+        "x": rng.normal(size=n),
+        "es_feriado": rng.integers(0, 2, n).astype(float),
+        "fin_de_semana": (day >= 6).astype(float),
+        "dia_semana": pd.Series(day).astype(str),
+        "severidad": rng.choice([0, 1, 2], n, p=[0.7, 0.25, 0.05]),
+    })
+
+
+def test_smote_nc_balances_the_classes_and_keeps_the_original_rows():
+    frame = _resampling_frame()
+    y = frame["severidad"].to_numpy()
+    numeric, categorical = ["x", "es_feriado", "fin_de_semana"], ["dia_semana"]
+    resampled, y_new = smote_nc_resample(frame, y, numeric, categorical)
+    assert np.unique(np.bincount(y_new)).size == 1 and np.bincount(y_new)[0] == np.bincount(y)[0]
+    pd.testing.assert_series_equal(resampled["x"].iloc[:len(frame)], frame["x"])
+    assert set(resampled["es_feriado"].unique()) <= {0.0, 1.0}
+    weekend = resampled["dia_semana"].isin(["6", "7"]).astype(float)
+    pd.testing.assert_series_equal(resampled["fin_de_semana"], weekend, check_names=False)
+    again, _ = smote_nc_resample(frame, y, numeric, categorical)
+    pd.testing.assert_frame_equal(resampled, again)
+    assert SeverityModel("logistic", {"class_weight": None}, numeric, categorical).fit(resampled, y_new).effective_prior_ == \
+        pytest.approx(1 / 3)
+
+
+def test_sensitivity_labels_keep_their_results_apart():
+    assert ExperimentConfig().label == "anomalies"
+    assert ExperimentConfig(dispatch_scenario=True).label == "anomalies_dispatch"
+    assert ExperimentConfig(direct_assignment_only=True).label == "anomalies_directonly"
+    assert ExperimentConfig(smote_nc=True).label == "anomalies_smotenc"
+
+
+def test_direct_only_restricts_every_frame_but_not_the_exposure(integrated_df):
+    hourly_path = Path(__file__).resolve().parents[1] / "data" / "processed" / "remmaq_meteorology_hourly.parquet"
+    if not hourly_path.exists():
+        pytest.skip("Hourly grid not available")
+    hourly = pd.read_parquet(hourly_path)
+    fold = expanding_folds()[0]
+    main_frames = fold_frames(integrated_df, hourly, fold)
+    direct_frames = fold_frames(integrated_df, hourly, fold, direct_only=True)
+    for split in ("fit", "val", "eval"):
+        rows = direct_frames[split].index
+        assert 0 < len(rows) < len(main_frames[split])
+        assert (integrated_df.loc[rows, "asignacion_clima"] == "directa").all()
+        pd.testing.assert_series_equal(direct_frames[split]["log_exposicion_celda_2km"],
+                                       main_frames[split].loc[rows, "log_exposicion_celda_2km"])
 
 
 def test_run_metadata_records_budget_environment_and_inputs(tmp_path):

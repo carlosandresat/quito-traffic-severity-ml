@@ -31,6 +31,13 @@ study with fixed defaults, all randomness is seeded, LightGBM runs in its
 deterministic mode, XGBoost uses a fixed number of threads (its subsampling
 depends on it), and Random Forest predicts on one thread. Every run writes the
 versions, budget, seed, hardware, input hashes and run time next to its results.
+
+Sensitivity analyses change one decision each and keep everything else: the
+training window, the weather mark, raw weather, independent hyperparameters, the
+dispatch scenario (crash type and vehicle counts in both configurations), the
+restriction to direct weather assignments (fit, validation and evaluation rows)
+and SMOTE-NC instead of class weights (synthetic rows in the fit years only, with
+the decision stage rescaling from the resampled class shares).
 """
 
 import argparse
@@ -51,6 +58,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 import xgboost as xgb
+from imblearn.over_sampling import SMOTENC
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -94,6 +102,10 @@ XGBOOST_N_THREADS: int = 4
 # Categories seen fewer times than this in training are pooled, so that sparse
 # 5 km cells do not become near-singular dummy columns.
 MIN_CATEGORY_FREQUENCY: int = 20
+
+# Numeric features that are flags: SMOTE-NC treats them as nominal, so that no
+# synthetic crash falls between the two values.
+BINARY_FEATURES: Tuple[str, ...] = ("fin_de_semana", "es_feriado", "lluvia_flag")
 
 # Smallest difference in macro F1 of interest (equivalence margin), fixed on
 # 25-oct-2026 before any result of the decision stage was seen
@@ -161,6 +173,15 @@ class ExperimentConfig:
     crash_hour_weather : bool
         Use the weather of the crash-hour mark, partly posterior to the crash,
         instead of the previous mark (sensitivity analysis).
+    dispatch_scenario : bool
+        Add the crash type and vehicle counts to both configurations (sensitivity
+        analysis).
+    direct_assignment_only : bool
+        Keep only the crashes whose weather comes from the nearest station, in
+        the fit, validation and evaluation rows (sensitivity analysis).
+    smote_nc : bool
+        Oversample the fit rows with SMOTE-NC instead of weighting the classes
+        (sensitivity analysis).
     """
 
     models: List[str] = field(default_factory=lambda: list(MODELS))
@@ -171,6 +192,9 @@ class ExperimentConfig:
     first_train_year: int = MAIN_WINDOW_START
     shared_hyperparameters: bool = True
     crash_hour_weather: bool = False
+    dispatch_scenario: bool = False
+    direct_assignment_only: bool = False
+    smote_nc: bool = False
 
     @property
     def label(self) -> str:
@@ -181,6 +205,12 @@ class ExperimentConfig:
             label += "_independent"
         if self.crash_hour_weather:
             label += "_crashhour"
+        if self.dispatch_scenario:
+            label += "_dispatch"
+        if self.direct_assignment_only:
+            label += "_directonly"
+        if self.smote_nc:
+            label += "_smotenc"
         return label
 
 
@@ -562,21 +592,25 @@ def candidate_params(model: str, n_candidates: int = N_CANDIDATES,
     return list(ParameterSampler(space, n_iter=min(n_candidates, grid_size), random_state=seed))
 
 
-def model_columns(model: str, config: str, raw_weather: bool) -> Tuple[List[str], List[str]]:
+def model_columns(model: str, config: str, raw_weather: bool, dispatch: bool = False
+                  ) -> Tuple[List[str], List[str]]:
     """Numeric and categorical feature columns of a learner and configuration."""
     cols = feature_columns(config, model="logistic" if model == "logistic" else "tree",
-                           raw_weather=raw_weather)
+                           raw_weather=raw_weather, dispatch=dispatch)
     return cols["numeric"], cols["categorical"]
 
 
-def fold_frames(df: pd.DataFrame, hourly: pd.DataFrame, fold: TemporalFold
-                ) -> Optional[Dict[str, pd.DataFrame]]:
+def fold_frames(df: pd.DataFrame, hourly: pd.DataFrame, fold: TemporalFold, dispatch: bool = False,
+                direct_only: bool = False) -> Optional[Dict[str, pd.DataFrame]]:
     """Fit, validation and evaluation frames of a fold.
 
     The model is fitted on the training years except the last one, which is the
     validation period. The climatology and the cell exposure are fitted on the
-    fit years only. Returns None when the fold has a single training year and
-    therefore no validation period.
+    fit years only. With ``direct_only``, the three frames keep the crashes with
+    a direct weather assignment, while the cell exposure still counts every crash
+    of the fit years, so the features mean the same as in the main design.
+    Returns None when the fold has a single training year and therefore no
+    validation period.
     """
     if fold.last_train_year - 1 < fold.first_train_year:
         return None
@@ -586,8 +620,41 @@ def fold_frames(df: pd.DataFrame, hourly: pd.DataFrame, fold: TemporalFold
     val_mask = (years == fold.last_train_year) & ~months.isin(UNEVALUATED_MONTHS)
     _, eval_mask = fold.masks(df)
     climatology = StationClimatology.fit(hourly, last_year=fold.last_train_year - 1)
-    frame = build_feature_frame(df, fit_mask, climatology)
-    return {"fit": frame[fit_mask], "val": frame[val_mask], "eval": frame[eval_mask]}
+    frame = build_feature_frame(df, fit_mask, climatology, dispatch=dispatch)
+    keep = df["asignacion_clima"] == "directa" if direct_only else pd.Series(True, index=df.index)
+    return {"fit": frame[fit_mask & keep], "val": frame[val_mask & keep], "eval": frame[eval_mask & keep]}
+
+
+def smote_nc_resample(X: pd.DataFrame, y: np.ndarray, numeric: List[str], categorical: List[str],
+                      seed: int = RANDOM_STATE) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Oversamples the minority classes of the fit rows up to the majority with SMOTE-NC.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Fit rows, without missing values in the feature columns.
+    y : np.ndarray
+        Classes of the fit rows.
+    numeric, categorical : List[str]
+        Feature columns; the flags among the numeric ones are treated as nominal.
+    seed : int
+        Seed of the sampler.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, np.ndarray]
+        Original and synthetic rows and their classes, with balanced classes. The
+        weekend flag of the synthetic rows is derived from their weekday, which
+        SMOTE-NC would otherwise draw separately. Cyclic features are interpolated
+        as they are, so a synthetic hour may fall off the unit circle.
+    """
+    columns = numeric + categorical
+    nominal = [c for c in numeric if c in BINARY_FEATURES] + categorical
+    # imbalanced-learn needs object columns to recognize the categories.
+    frame = X[columns].astype({c: object for c in categorical})
+    resampled, y_resampled = SMOTENC(categorical_features=nominal, random_state=seed).fit_resample(frame, y)
+    resampled["fin_de_semana"] = resampled["dia_semana"].isin(["6", "7"]).astype(float)
+    return resampled, y_resampled
 
 
 def _fold_eval_year(fold_name: str) -> int:
@@ -647,18 +714,27 @@ def run_folds(
     tuning_rows, metric_rows, delta_rows, prediction_frames, pooled_input = [], [], [], [], []
     for fold in folds:
         t0 = time.time()
-        frames = fold_frames(df, hourly, fold)
+        frames = fold_frames(df, hourly, fold, config.dispatch_scenario, config.direct_assignment_only)
         if frames is None:
             continue
         y = {split: frames[split][TARGET].to_numpy() for split in ("fit", "val", "eval")}
 
+        # Each configuration is resampled once per fold, on its own columns, and
+        # every candidate is fitted on the same synthetic rows.
+        fit_data = {cfg: (frames["fit"], y["fit"]) for cfg in CONFIGS}
+        if config.smote_nc:
+            for cfg in CONFIGS:
+                numeric, categorical = model_columns(model, cfg, config.raw_weather, config.dispatch_scenario)
+                fit_data[cfg] = smote_nc_resample(frames["fit"], y["fit"], numeric, categorical, config.seed)
+
         fitted: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for i, params in enumerate(candidates):
             row = {"model": model, "fold": fold.name, "candidate": i, "params": repr(params)}
+            learner_params = {**params, "class_weight": None} if config.smote_nc else params
             for cfg in CONFIGS:
-                numeric, categorical = model_columns(model, cfg, config.raw_weather)
-                learner = SeverityModel(model, params, numeric, categorical, config.seed)
-                learner.fit(frames["fit"], y["fit"])
+                numeric, categorical = model_columns(model, cfg, config.raw_weather, config.dispatch_scenario)
+                learner = SeverityModel(model, learner_params, numeric, categorical, config.seed)
+                learner.fit(*fit_data[cfg])
                 p_val, p_eval = learner.predict_proba(frames["val"]), learner.predict_proba(frames["eval"])
                 rule = DecisionRule.fit(p_val, y["val"], effective_prior=learner.effective_prior_)
                 row[f"val_f1_{cfg}"] = macro_f1_from_labels(y["val"], rule.predict(p_val))
@@ -928,6 +1004,12 @@ if __name__ == "__main__":
                         help="Each configuration keeps its own best candidate (sensitivity).")
     parser.add_argument("--crash-hour-weather", action="store_true",
                         help="Weather of the crash-hour mark instead of the previous mark (sensitivity).")
+    parser.add_argument("--dispatch-scenario", action="store_true",
+                        help="Add the crash type and vehicle counts to both configurations (sensitivity).")
+    parser.add_argument("--direct-assignment-only", action="store_true",
+                        help="Keep only crashes with a direct weather assignment (sensitivity).")
+    parser.add_argument("--smote-nc", action="store_true",
+                        help="Oversample the fit rows with SMOTE-NC instead of class weights (sensitivity).")
     parser.add_argument("--summarize-only", action="store_true",
                         help="Only compute the confirmatory contrast from saved results.")
     args = parser.parse_args()
@@ -935,5 +1017,7 @@ if __name__ == "__main__":
                           n_candidates=args.n_candidates, bootstrap_replicates=args.bootstrap,
                           seed=args.seed, first_train_year=args.first_train_year,
                           shared_hyperparameters=not args.independent_hyperparameters,
-                          crash_hour_weather=args.crash_hour_weather),
+                          crash_hour_weather=args.crash_hour_weather,
+                          dispatch_scenario=args.dispatch_scenario,
+                          direct_assignment_only=args.direct_assignment_only, smote_nc=args.smote_nc),
          summarize_only=args.summarize_only)

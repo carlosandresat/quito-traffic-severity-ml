@@ -20,8 +20,12 @@ crash hour begins, so it is known at the prediction moment. On the validation
 years it lost no information against the crash-hour mark. The crash-hour
 weather is a sensitivity analysis.
 
-No climate-quality indicator, post-event field (crash type, vehicles, cause) or
-victim count is ever a feature. The distance to the station that supplied the
+No climate-quality indicator, cause or victim count is ever a feature. The crash
+type and the vehicle counts are recorded after the crash, so they enter only the
+dispatch-scenario sensitivity analysis, in both configurations. The count of
+unidentified vehicles, which implies that a driver fled, never enters; neither
+does 'suma_de_vehiculos', which includes it and would reconstruct it from the
+other counts. The distance to the station that supplied the
 weather is excluded too: together with the distance to the nearest station it
 reconstructs the fallback flag exactly (their difference is at most 0.001 km
 for every direct assignment and at least 0.002 km for every fallback).
@@ -75,6 +79,15 @@ CLIMATE_MONTH, CLIMATE_HOUR = "mes_clima", "hora_clima"
 # hour of the day, is dropped.
 LOGISTIC_DROPPED: List[str] = ["lluvia_acum_6h", f"rs{ANOMALY_SUFFIX}", "rs"]
 
+# Dispatch scenario (sensitivity analysis): fields recorded when the crash is attended.
+VEHICLE_COUNTS: List[str] = [
+    "automovil", "bicicleta", "bus", "camion", "camioneta", "emergencias", "especial", "furgoneta",
+    "motocicleta", "scooter_electrico", "tricimoto", "vehiculo_deportivo_utilitario",
+]
+IDENTIFIED_VEHICLES: str = "vehiculos_identificados"
+DISPATCH_NUMERIC: List[str] = VEHICLE_COUNTS + [IDENTIFIED_VEHICLES]
+DISPATCH_CATEGORICAL: List[str] = ["tipo_siniestro"]
+
 TARGET: str = "severidad"
 
 
@@ -118,7 +131,8 @@ def control_entity(crash_ids: pd.Series) -> pd.Series:
                      index=crash_ids.index)
 
 
-def feature_columns(config: str, model: str = "tree", raw_weather: bool = False) -> Dict[str, List[str]]:
+def feature_columns(config: str, model: str = "tree", raw_weather: bool = False,
+                    dispatch: bool = False) -> Dict[str, List[str]]:
     """Numeric and categorical columns of a configuration.
 
     Parameters
@@ -129,6 +143,9 @@ def feature_columns(config: str, model: str = "tree", raw_weather: bool = False)
         'tree' or 'logistic'; the logistic model uses the reduced weather block.
     raw_weather : bool
         Use raw weather values instead of anomalies (sensitivity analysis).
+    dispatch : bool
+        Add the crash type and vehicle counts to both configurations (sensitivity
+        analysis). The logistic model omits their sum, a linear function of the counts.
 
     Returns
     -------
@@ -138,11 +155,15 @@ def feature_columns(config: str, model: str = "tree", raw_weather: bool = False)
     if config not in {"base", "enriched"}:
         raise ValueError(f"Unknown configuration: {config}")
     numeric = list(BASE_NUMERIC)
+    categorical = list(BASE_CATEGORICAL)
     if config == "enriched":
         numeric += (WEATHER_RAW if raw_weather else WEATHER_ANOMALIES) + WEATHER_COMMON
         if model == "logistic":
             numeric = [c for c in numeric if c not in LOGISTIC_DROPPED]
-    return {"numeric": numeric, "categorical": list(BASE_CATEGORICAL)}
+    if dispatch:
+        numeric += [c for c in DISPATCH_NUMERIC if not (model == "logistic" and c == IDENTIFIED_VEHICLES)]
+        categorical += DISPATCH_CATEGORICAL
+    return {"numeric": numeric, "categorical": categorical}
 
 
 def previous_hour_weather(df: pd.DataFrame, hourly: pd.DataFrame) -> pd.DataFrame:
@@ -181,6 +202,7 @@ def build_feature_frame(
     df: pd.DataFrame,
     train_mask: pd.Series,
     climatology: Optional[StationClimatology] = None,
+    dispatch: bool = False,
 ) -> pd.DataFrame:
     """Builds every candidate feature, fitting data-dependent ones on training rows.
 
@@ -195,6 +217,9 @@ def build_feature_frame(
     climatology : Optional[StationClimatology]
         Climatology fitted on the training years of the fold; required for the
         weather anomalies and for imputing missing weather values.
+    dispatch : bool
+        Also build the crash type (missing in the 226 records of March 2020,
+        kept as missing) and the vehicle counts of the dispatch scenario.
 
     Returns
     -------
@@ -231,6 +256,11 @@ def build_feature_frame(
     out["dir_cos"] = np.cos(np.deg2rad(df["dir"].astype(float))).fillna(0.0)
     for var in PRECIPITATION:
         out[var] = df[var].astype(float).fillna(0.0)
+    if dispatch:
+        out["tipo_siniestro"] = df["tipo_siniestro"].astype(object)
+        for var in VEHICLE_COUNTS:
+            out[var] = df[var].astype(float)
+        out[IDENTIFIED_VEHICLES] = out[VEHICLE_COUNTS].sum(axis=1)
 
     out["ente_control"] = control_entity(df["id_siniestro"])
     out[TARGET] = df[TARGET].astype(int)
