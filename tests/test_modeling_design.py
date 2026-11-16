@@ -449,3 +449,45 @@ def test_xgboost_thread_count_is_fixed_by_the_study():
     params = dict(candidate_params("xgboost", n_candidates=1)[0], n_estimators=10)
     model = SeverityModel("xgboost", params, ["x"], ["cell"]).fit(train, train["severidad"].to_numpy())
     assert model.model_.get_params()["n_jobs"] == XGBOOST_N_THREADS
+
+
+def test_effective_cores_follow_the_affinity_mask_when_the_platform_has_one(monkeypatch):
+    import os
+    from src.train_models import effective_cpu_count
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1}, raising=False)
+    assert effective_cpu_count() == 2
+    monkeypatch.delattr(os, "sched_getaffinity")
+    assert effective_cpu_count() == 8
+
+
+def test_xgboost_is_refused_before_reading_data_when_cores_are_fewer_than_threads(monkeypatch, tmp_path):
+    """XGBoost caps its threads at the available cores, so the parameter alone
+    does not fix the threads it uses; the number of cores is simulated."""
+    import src.train_models as tm
+    missing = tmp_path / "no_data"
+
+    def run(models, cores, **kwargs):
+        monkeypatch.setattr(tm, "effective_cpu_count", lambda: cores)
+        return train_main(ExperimentConfig(models=models), report_dir=tmp_path, prediction_dir=tmp_path,
+                          processed_dir=missing, **kwargs)
+
+    with pytest.raises(RuntimeError, match=f"XGBoost needs {tm.XGBOOST_N_THREADS} cores"):
+        run(["xgboost"], tm.XGBOOST_N_THREADS - 1)
+    with pytest.raises(RuntimeError, match="XGBoost needs"):
+        run(list(MODELS), 1)
+    # With enough cores, or without XGBoost, the run goes on to read the data.
+    with pytest.raises(FileNotFoundError):
+        run(["xgboost"], tm.XGBOOST_N_THREADS)
+    with pytest.raises(FileNotFoundError):
+        run(["logistic", "random_forest", "lightgbm"], 1)
+    # Summarizing saved results fits nothing.
+    assert run(["xgboost"], 1, summarize_only=True) == {}
+
+
+def test_run_metadata_records_the_effective_cores(monkeypatch, tmp_path):
+    import src.train_models as tm
+    monkeypatch.setattr(tm, "effective_cpu_count", lambda: 3)
+    meta = run_metadata(ExperimentConfig(), [], 0.0, 1.0)
+    assert meta["effective_cpu_count"] == 3 and "cpu_count" in meta
+    assert meta["fixed_threads"]["xgboost"] == tm.XGBOOST_N_THREADS

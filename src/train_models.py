@@ -29,8 +29,9 @@ of the four learners is reported with Holm's correction.
 Results do not depend on the hardware: the tuning budget is a parameter of the
 study with fixed defaults, all randomness is seeded, LightGBM runs in its
 deterministic mode, XGBoost uses a fixed number of threads (its subsampling
-depends on it), and Random Forest predicts on one thread. Every run writes the
-versions, budget, seed, hardware, input hashes and run time next to its results.
+depends on it) and is refused on a machine that offers fewer cores, and Random
+Forest predicts on one thread. Every run writes the versions, budget, seed,
+hardware, input hashes and run time next to its results.
 
 Sensitivity analyses change one decision each and keep everything else: the
 training window, the weather mark, raw weather, independent hyperparameters, the
@@ -96,6 +97,8 @@ BOOTSTRAP_REPLICATES: int = 2000
 # the number of threads: on the first fold, 1 and 4 threads give probabilities
 # that differ by up to 0.27, while repeated runs with the same thread count are
 # identical. The thread count is therefore fixed as a parameter of the study.
+# XGBoost caps its threads at the cores it may use, so with fewer cores it would
+# fit another model without warning: ``main`` refuses such a run.
 # LightGBM (deterministic mode) and Random Forest do not depend on it.
 XGBOOST_N_THREADS: int = 4
 
@@ -871,6 +874,21 @@ def confirmatory_contrast(
     return {"selection": selection, "primary": pd.DataFrame(primary), "secondary": secondary}
 
 
+def effective_cpu_count() -> int:
+    """Cores the process may use.
+
+    Returns
+    -------
+    int
+        Size of the CPU affinity mask where the platform exposes it (Linux), which
+        is what bounds the threads of XGBoost; the total core count elsewhere.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -918,6 +936,7 @@ def run_metadata(config: ExperimentConfig, inputs: List[Path], started: float, f
         "platform": platform.platform(),
         "processor": platform.processor(),
         "cpu_count": os.cpu_count(),
+        "effective_cpu_count": effective_cpu_count(),
         "inputs": {p.name: _sha256(p) for p in inputs},
         "started_utc": datetime.fromtimestamp(started, timezone.utc).isoformat(),
         "elapsed_seconds": round(finished - started, 1),
@@ -956,6 +975,10 @@ def main(
 
     results: Dict[str, Any] = {}
     if not summarize_only:
+        if "xgboost" in config.models and effective_cpu_count() < XGBOOST_N_THREADS:
+            raise RuntimeError(
+                f"XGBoost needs {XGBOOST_N_THREADS} cores to reproduce the study; "
+                f"this machine offers {effective_cpu_count()}.")
         df = pd.read_parquet(inputs[0])
         hourly = pd.read_parquet(inputs[1])
         for model in config.models:
