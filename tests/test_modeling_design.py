@@ -34,11 +34,13 @@ from src.train_models import (
     experiment_folds,
     fold_frames,
     holdout_reading,
+    model_columns,
     pooled_bootstrap_contrast,
     run_folds,
     run_metadata,
     selected_candidates,
     smote_nc_resample,
+    trivial_references,
     weighted_average_precision,
 )
 from src.train_models import main as train_main
@@ -163,6 +165,60 @@ def test_weather_comes_from_the_previous_mark_of_the_same_station():
     # 2019-03-02 00:00 -> 2019-03-01 23:00 (index 23); 2019-03-03 14:00 -> 13:00 (index 61) at Tumbaco.
     assert out.loc[0, "tmp"] == 23.0 and out.loc[1, "lluvia_1h"] == 1061.0
     assert out[CLIMATE_HOUR].tolist() == [23, 13] and out[CLIMATE_MONTH].tolist() == [3, 3]
+
+
+def test_minimal_baselines_contrast_their_set_with_the_full_baseline():
+    time_set = {"hora_sin", "hora_cos", "fin_de_semana", "dia_semana"}
+    place_set = {"celda_5km", "estacion_geografica_mas_cercana", "distancia_geografica_mas_cercana_km",
+                 "log_exposicion_celda_2km"}
+    assert not time_set & place_set
+    assert not {"mes_sin", "mes_cos", "es_feriado", "periodo_movilidad"} & (time_set | place_set)
+    for model in MODELS:
+        for feature_set, expected in (("timeonly", time_set), ("spaceonly", place_set)):
+            numeric, categorical = model_columns(model, "base", raw_weather=False, feature_set=feature_set)
+            assert set(numeric + categorical) == expected
+            assert set(numeric) < set(BASE_NUMERIC) and set(categorical) < set(BASE_CATEGORICAL)
+            # The full baseline takes the place of the enriched model: no weather column enters.
+            assert model_columns(model, "enriched", raw_weather=False, feature_set=feature_set) ==                 (BASE_NUMERIC, BASE_CATEGORICAL)
+        for config in ("base", "enriched"):
+            columns = feature_columns(config, model="logistic" if model == "logistic" else "tree")
+            assert model_columns(model, config, raw_weather=False) == (columns["numeric"], columns["categorical"])
+    with pytest.raises(ValueError, match="Unknown configuration"):
+        model_columns("logistic", "other", raw_weather=False, feature_set="timeonly")
+
+
+def test_minimal_baseline_runs_have_their_own_labels_and_admit_no_weather_option():
+    assert ExperimentConfig(feature_set="timeonly").label == "anomalies_timeonly"
+    assert ExperimentConfig(feature_set="spaceonly").label == "anomalies_spaceonly"
+    assert ExperimentConfig(feature_set="timeonly", first_train_year=2019, holdout=True).label ==         "anomalies_from2019_timeonly_holdout"
+    assert ExperimentConfig(feature_set="full").label == "anomalies"
+    for option in ("raw_weather", "crash_hour_weather", "dispatch_scenario", "smote_nc"):
+        with pytest.raises(ValueError, match="minimal-baseline"):
+            ExperimentConfig(feature_set="spaceonly", **{option: True})
+    with pytest.raises(ValueError, match="Unknown feature set"):
+        ExperimentConfig(feature_set="weatheronly")
+
+
+def test_trivial_references_use_no_feature():
+    from sklearn.metrics import f1_score
+    rng = np.random.default_rng(8)
+    y_fit = rng.choice([0, 1, 2], 20000, p=[0.53, 0.42, 0.05])
+    y_eval = rng.choice([0, 1, 2], 4000, p=[0.50, 0.42, 0.08])
+    fit_shares, eval_shares = np.bincount(y_fit) / len(y_fit), np.bincount(y_eval) / len(y_eval)
+    constant, stratified = trivial_references(y_fit, y_eval, n_draws=500)
+    assert (constant["reference"], stratified["reference"]) == ("constant", "stratified")
+    majority = np.full(len(y_eval), fit_shares.argmax())
+    assert constant["f1_macro"] == pytest.approx(f1_score(y_eval, majority, average="macro", zero_division=0))
+    assert constant["recall_2"] == 0 and constant["precision_2"] == 0
+    # A draw with the fit shares: recall is the fit share and precision the evaluated share.
+    assert stratified["f1_macro"] == pytest.approx(
+        np.mean(2 * fit_shares * eval_shares / (fit_shares + eval_shares)), abs=0.003)
+    assert stratified["recall_2"] == pytest.approx(fit_shares[2], abs=0.005)
+    assert stratified["precision_2"] == pytest.approx(eval_shares[2], abs=0.005)
+    for reference in (constant, stratified):
+        assert reference["pr_auc_2"] == pytest.approx(eval_shares[2])
+        assert reference["log_loss"] == pytest.approx(-np.mean(np.log(fit_shares[y_eval])))
+    assert trivial_references(y_fit, y_eval, n_draws=500) == [constant, stratified]
 
 
 # --- Folds -----------------------------------------------------------------------------
@@ -461,6 +517,29 @@ def test_every_learner_is_exactly_reproducible():
         assert np.array_equal(runs[0], runs[1]), name
 
 
+def test_full_baseline_of_a_minimal_run_is_the_baseline_of_the_main_run(synthetic_study):
+    """End to end on synthetic data: in a minimal-baseline run the model in the
+    place of the enriched one is, candidate by candidate, the baseline of the
+    main run, and the references without features are the same."""
+    df, hourly = synthetic_study
+    fold = [expanding_folds()[-1]]
+    budget = dict(n_candidates=1, bootstrap_replicates=20)
+    main_run = run_folds(df, hourly, "logistic", ExperimentConfig(**budget), folds=fold, verbose=False)
+    raw = ["row", "split", "severidad", "p0", "p1", "p2"]
+    baseline = main_run["predictions"].query("config == 'base'")[raw].reset_index(drop=True)
+    for feature_set in ("timeonly", "spaceonly"):
+        minimal_run = run_folds(df, hourly, "logistic", ExperimentConfig(feature_set=feature_set, **budget),
+                                folds=fold, verbose=False)
+        predictions = minimal_run["predictions"]
+        full = predictions.query("config == 'enriched'")[raw].reset_index(drop=True)
+        pd.testing.assert_frame_equal(full, baseline, check_exact=True)
+        minimal = predictions.query("config == 'base'")[raw].reset_index(drop=True)
+        assert minimal["row"].equals(baseline["row"])
+        assert not np.allclose(minimal[["p0", "p1", "p2"]], baseline[["p0", "p1", "p2"]])
+        pd.testing.assert_frame_equal(minimal_run["trivial"], main_run["trivial"], check_exact=True)
+    assert main_run["trivial"]["reference"].tolist() == ["constant", "stratified"]
+
+
 def _alter_from(df: pd.DataFrame, hourly: pd.DataFrame, year: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Copies of the data with every crash and every hourly record from ``year`` on changed."""
     df, hourly = df.copy(), hourly.copy()
@@ -586,7 +665,7 @@ def test_test_run_writes_only_files_of_its_own_label(synthetic_study, tmp_path):
     config = ExperimentConfig(models=["logistic"], n_candidates=1, bootstrap_replicates=20, holdout=True)
     out = train_main(config, report_dir=reports, prediction_dir=predictions, processed_dir=tmp_path)["logistic"]
     written = [path.name for path in [*reports.iterdir(), *predictions.iterdir()]]
-    assert len(written) == 6 and all("_anomalies_holdout_c1_b20_" in name for name in written)
+    assert len(written) == 7 and all("_anomalies_holdout_c1_b20_" in name for name in written)
     assert out["metrics"]["fold"].unique().tolist() == ["2017-2025->2026"]
     assert out["pooled"]["n_folds"].tolist() == [1]
     years = pd.to_datetime(out["predictions"]["fecha"]).dt.year

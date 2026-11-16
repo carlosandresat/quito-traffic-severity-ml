@@ -88,6 +88,16 @@ IDENTIFIED_VEHICLES: str = "vehiculos_identificados"
 DISPATCH_NUMERIC: List[str] = VEHICLE_COUNTS + [IDENTIFIED_VEHICLES]
 DISPATCH_CATEGORICAL: List[str] = ["tipo_siniestro"]
 
+# Minimal baselines: the part of the baseline that only knows the hour and the
+# day, and the part that only knows the place. They show how much the baseline
+# gains over each of them. The month, the holiday flag and the mobility period
+# stay in the full baseline only.
+MINIMAL_FEATURE_SETS: Dict[str, Dict[str, List[str]]] = {
+    "timeonly": {"numeric": ["hora_sin", "hora_cos", "fin_de_semana"], "categorical": ["dia_semana"]},
+    "spaceonly": {"numeric": ["distancia_geografica_mas_cercana_km", "log_exposicion_celda_2km"],
+                  "categorical": ["celda_5km", "estacion_geografica_mas_cercana"]},
+}
+
 TARGET: str = "severidad"
 
 

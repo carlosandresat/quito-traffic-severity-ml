@@ -40,6 +40,13 @@ restriction to direct weather assignments (fit, validation and evaluation rows)
 and SMOTE-NC instead of class weights (synthetic rows in the fit years only, with
 the decision stage rescaling from the resampled class shares).
 
+The minimal baselines are runs of their own (``feature_set``) that use no
+weather: a set with only the hour and the day, or only the place, takes the
+place of the baseline, and the full baseline takes the place of the enriched
+model, so the same procedure measures what the baseline adds to each set. Every
+run also reports two references that use no feature at all (the most frequent
+class and a draw with the class shares of the fit rows).
+
 The test of January-July 2026 is a run of its own (``holdout``): one fold fitted
 up to 2024 and validated on 2025, written under its own label so that it cannot
 overwrite the results of the folds, and contrasted as a single period. No other
@@ -85,13 +92,15 @@ from src.climatology import StationClimatology
 from src.decision import (EPSILON, DecisionRule, expected_calibration_error, macro_f1_from_labels,
                           multiclass_log_loss)
 from src.eda_statistics import holm_adjust
-from src.features import TARGET, build_feature_frame, feature_columns, previous_hour_weather
+from src.features import (MINIMAL_FEATURE_SETS, TARGET, build_feature_frame, feature_columns,
+                          previous_hour_weather)
 from src.folds import MAIN_WINDOW_START, UNEVALUATED_MONTHS, TemporalFold, expanding_folds, holdout_fold
 
 RANDOM_STATE: int = 20261024
 CLASSES: List[int] = [0, 1, 2]
 CONFIGS: Tuple[str, str] = ("base", "enriched")
 MODELS: List[str] = ["logistic", "random_forest", "xgboost", "lightgbm"]
+FEATURE_SETS: Tuple[str, ...] = ("full", *MINIMAL_FEATURE_SETS)
 
 # Study defaults of the computational budget. They are parameters of the study,
 # not of the machine: a faster computer runs the same experiment in less time.
@@ -193,6 +202,10 @@ class ExperimentConfig:
     holdout : bool
         Run the single test fold (fit up to 2024, validate on 2025, evaluate
         January-July 2026) instead of the expanding-origin folds.
+    feature_set : str
+        'full' for the comparison of the baseline with the enriched model;
+        'timeonly' or 'spaceonly' for a minimal-baseline run, which contrasts
+        that minimal set with the full baseline and uses no weather.
     """
 
     models: List[str] = field(default_factory=lambda: list(MODELS))
@@ -207,6 +220,15 @@ class ExperimentConfig:
     direct_assignment_only: bool = False
     smote_nc: bool = False
     holdout: bool = False
+    feature_set: str = "full"
+
+    def __post_init__(self) -> None:
+        if self.feature_set not in FEATURE_SETS:
+            raise ValueError(f"Unknown feature set: {self.feature_set}")
+        if self.feature_set != "full" and (self.raw_weather or self.crash_hour_weather
+                                           or self.dispatch_scenario or self.smote_nc):
+            raise ValueError("A minimal-baseline run uses no weather and no dispatch field and is not "
+                             "resampled: it cannot be combined with those sensitivity analyses.")
 
     @property
     def label(self) -> str:
@@ -223,6 +245,8 @@ class ExperimentConfig:
             label += "_directonly"
         if self.smote_nc:
             label += "_smotenc"
+        if self.feature_set != "full":
+            label += f"_{self.feature_set}"
         if self.holdout:
             label += "_holdout"
         # A run with another budget or seed writes to its own files, so it cannot
@@ -552,6 +576,53 @@ def holdout_reading(ci95_low: float, ci95_high: float) -> str:
     return "compatible with the folds"
 
 
+def trivial_references(y_fit: np.ndarray, y_eval: np.ndarray, n_draws: int = BOOTSTRAP_REPLICATES,
+                       seed: int = RANDOM_STATE) -> List[Dict[str, Any]]:
+    """Metrics of two references that use no feature, on one evaluated period.
+
+    Parameters
+    ----------
+    y_fit, y_eval : np.ndarray
+        Classes of the fit rows and of the evaluated rows.
+    n_draws : int
+        Draws of the stratified reference.
+    seed : int
+        Seed of the draws.
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        One entry per reference. 'constant' assigns every crash to the most
+        frequent class of the fit rows. 'stratified' draws the class of every
+        crash with the class shares of the fit rows; its metrics are the mean
+        over the draws. Both give every crash those shares as probabilities, so
+        their fatal PR-AUC is the prevalence and their log loss that of the prior.
+    """
+    k = len(CLASSES)
+    shares = np.bincount(y_fit, minlength=k) / len(y_fit)
+    truth = np.bincount(y_eval, minlength=k)
+    common = {"log_loss": multiclass_log_loss(y_eval, np.tile(shares, (len(y_eval), 1))),
+              "pr_auc_2": float(np.mean(y_eval == 2))}
+
+    def summary(cm: np.ndarray) -> Dict[str, float]:
+        # cm: confusion matrices (true x predicted), one per draw.
+        tp = np.diagonal(cm, axis1=1, axis2=2)
+        actual, predicted = cm.sum(axis=2), cm.sum(axis=1)
+        f1 = np.divide(2 * tp, actual + predicted, out=np.zeros(tp.shape), where=(actual + predicted) > 0)
+        recall = np.divide(tp, actual, out=np.zeros(tp.shape), where=actual > 0)
+        precision = np.divide(tp, predicted, out=np.zeros(tp.shape), where=predicted > 0)
+        return {"f1_macro": float(f1.mean(axis=1).mean()), "f1_2": float(f1[:, 2].mean()),
+                "recall_2": float(recall[:, 2].mean()), "precision_2": float(precision[:, 2].mean())}
+
+    constant = np.zeros((1, k, k))
+    constant[0, :, shares.argmax()] = truth
+    # Given its true class, the drawn classes of a group of crashes are multinomial.
+    rng = np.random.default_rng(seed)
+    draws = np.stack([rng.multinomial(int(n), shares, size=n_draws) for n in truth], axis=1).astype(float)
+    return [{"reference": "constant", **summary(constant), **common},
+            {"reference": "stratified", **summary(draws), **common}]
+
+
 def pooled_bootstrap_contrast(
     folds: List[FoldPredictions],
     n_replicates: int = BOOTSTRAP_REPLICATES,
@@ -624,9 +695,23 @@ def candidate_params(model: str, n_candidates: int = N_CANDIDATES,
     return list(ParameterSampler(space, n_iter=min(n_candidates, grid_size), random_state=seed))
 
 
-def model_columns(model: str, config: str, raw_weather: bool, dispatch: bool = False
-                  ) -> Tuple[List[str], List[str]]:
-    """Numeric and categorical feature columns of a learner and configuration."""
+def model_columns(model: str, config: str, raw_weather: bool, dispatch: bool = False,
+                  feature_set: str = "full") -> Tuple[List[str], List[str]]:
+    """Numeric and categorical feature columns of a learner and configuration.
+
+    In a minimal-baseline run (``feature_set`` other than 'full') the contrasted
+    pair changes: the minimal set takes the place of the baseline ('base') and
+    the full baseline takes the place of the enriched model ('enriched'), so the
+    difference measures what the baseline adds to that set. No weather column
+    enters either of them.
+    """
+    if feature_set != "full":
+        if config not in CONFIGS:
+            raise ValueError(f"Unknown configuration: {config}")
+        if config == "base":
+            minimal = MINIMAL_FEATURE_SETS[feature_set]
+            return list(minimal["numeric"]), list(minimal["categorical"])
+        config = "base"
     cols = feature_columns(config, model="logistic" if model == "logistic" else "tree",
                            raw_weather=raw_weather, dispatch=dispatch)
     return cols["numeric"], cols["categorical"]
@@ -766,7 +851,9 @@ def run_folds(
         of every contrast statistic per fold), 'pooled' (mean over folds) and
         'predictions' (validation and evaluation probabilities, calibrated
         probabilities and decided classes of the selected candidates, with the
-        date of each crash as its resampling block).
+        date of each crash as its resampling block). 'trivial' holds the
+        references without features of every fold, which do not depend on the
+        learner.
     """
     folds = folds or experiment_folds(config)
     if not any(fold.last_train_year > fold.first_train_year for fold in folds):
@@ -778,19 +865,23 @@ def run_folds(
     if not config.crash_hour_weather:
         df = previous_hour_weather(df, hourly)
     tuning_rows, metric_rows, delta_rows, prediction_frames, pooled_input = [], [], [], [], []
+    trivial_rows: List[Dict[str, Any]] = []
     for fold in folds:
         t0 = time.time()
         frames = fold_frames(df, hourly, fold, config.dispatch_scenario, config.direct_assignment_only)
         if frames is None:
             continue
         y = {split: frames[split][TARGET].to_numpy() for split in ("fit", "val", "eval")}
+        trivial_rows.extend({"fold": fold.name, "n_eval": len(y["eval"]), **row} for row in trivial_references(
+            y["fit"], y["eval"], config.bootstrap_replicates, config.seed))
 
         # Each configuration is resampled once per fold, on its own columns, and
         # every candidate is fitted on the same synthetic rows.
         fit_data = {cfg: (frames["fit"], y["fit"]) for cfg in CONFIGS}
         if config.smote_nc:
             for cfg in CONFIGS:
-                numeric, categorical = model_columns(model, cfg, config.raw_weather, config.dispatch_scenario)
+                numeric, categorical = model_columns(model, cfg, config.raw_weather, config.dispatch_scenario,
+                                                     config.feature_set)
                 fit_data[cfg] = smote_nc_resample(frames["fit"], y["fit"], numeric, categorical, config.seed)
 
         fitted: Dict[Tuple[int, str], Dict[str, Any]] = {}
@@ -798,7 +889,8 @@ def run_folds(
             row = {"model": model, "fold": fold.name, "candidate": i, "params": repr(params)}
             learner_params = {**params, "class_weight": None} if config.smote_nc else params
             for cfg in CONFIGS:
-                numeric, categorical = model_columns(model, cfg, config.raw_weather, config.dispatch_scenario)
+                numeric, categorical = model_columns(model, cfg, config.raw_weather, config.dispatch_scenario,
+                                                     config.feature_set)
                 learner = SeverityModel(model, learner_params, numeric, categorical, config.seed)
                 learner.fit(*fit_data[cfg])
                 p_val, p_eval = learner.predict_proba(frames["val"]), learner.predict_proba(frames["eval"])
@@ -855,7 +947,8 @@ def run_folds(
         pooled_input, config.bootstrap_replicates, config.seed)}])
     return {"tuning": pd.DataFrame(tuning_rows), "metrics": pd.DataFrame(metric_rows),
             "deltas": pd.DataFrame(delta_rows), "pooled": pooled,
-            "predictions": pd.concat(prediction_frames, ignore_index=True)}
+            "predictions": pd.concat(prediction_frames, ignore_index=True),
+            "trivial": pd.DataFrame(trivial_rows)}
 
 
 def confirmatory_contrast(
@@ -1059,6 +1152,8 @@ def main(
                 out[name].to_csv(report_dir / f"{model}_{name}_{config.label}.csv", index=False)
             out["predictions"].to_parquet(prediction_dir / f"{model}_predictions_{config.label}.parquet",
                                           index=False)
+            # The same table for every learner: it only depends on the folds and the seed.
+            out["trivial"].to_csv(report_dir / f"trivial_references_{config.label}.csv", index=False)
             pooled = out["pooled"].iloc[0]
             print(f"  pooled delta F1 {pooled['delta_f1_macro']:+.4f} "
                   f"[{pooled['delta_f1_macro_ci95_low']:+.4f}, {pooled['delta_f1_macro_ci95_high']:+.4f}], "
@@ -1108,6 +1203,9 @@ if __name__ == "__main__":
                         help="Keep only crashes with a direct weather assignment (sensitivity).")
     parser.add_argument("--smote-nc", action="store_true",
                         help="Oversample the fit rows with SMOTE-NC instead of class weights (sensitivity).")
+    parser.add_argument("--feature-set", choices=FEATURE_SETS, default="full",
+                        help="Minimal-baseline run: contrast the hour-and-day set or the place set with "
+                             "the full baseline, without weather.")
     parser.add_argument("--holdout", action="store_true",
                         help="Run the test of January-July 2026 (fit to 2024, validate on 2025) instead "
                              "of the folds.")
@@ -1121,5 +1219,5 @@ if __name__ == "__main__":
                           crash_hour_weather=args.crash_hour_weather,
                           dispatch_scenario=args.dispatch_scenario,
                           direct_assignment_only=args.direct_assignment_only, smote_nc=args.smote_nc,
-                          holdout=args.holdout),
+                          holdout=args.holdout, feature_set=args.feature_set),
          summarize_only=args.summarize_only)
