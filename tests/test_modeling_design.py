@@ -35,6 +35,7 @@ from src.train_models import (
     fold_frames,
     holdout_reading,
     model_columns,
+    placebo_weather,
     pooled_bootstrap_contrast,
     run_folds,
     run_metadata,
@@ -711,6 +712,104 @@ def test_candidate_file_holds_every_candidate_and_reproduces_the_selection(synth
             rule = DecisionRule.fit(p, y, effective_prior=rows[["prior0", "prior1", "prior2"]].iloc[0].to_numpy())
             stored = tuning[(tuning["fold"] == chosen["fold"]) & (tuning["candidate"] == candidate)]
             assert macro_f1_from_labels(y, rule.predict(p)) == stored[f"val_f1_{chosen['config']}"].iloc[0]
+
+
+def test_unweighted_and_placebo_runs_have_their_own_labels():
+    assert ExperimentConfig(class_weights=False).label == "anomalies_unweighted"
+    assert ExperimentConfig(placebo_weather=3).label == "anomalies_placebo3"
+    # Seed 0 is a placebo too: only None means the observed weather.
+    assert ExperimentConfig(placebo_weather=0).label == "anomalies_placebo0"
+    assert ExperimentConfig(placebo_weather=None, class_weights=True).label == "anomalies"
+    assert ExperimentConfig(first_train_year=2019, class_weights=False, placebo_weather=2, holdout=True).label ==         "anomalies_from2019_unweighted_placebo2_holdout"
+    with pytest.raises(ValueError, match="SMOTE-NC already fits without class weights"):
+        ExperimentConfig(smote_nc=True, class_weights=False)
+    for option in ({"crash_hour_weather": True}, {"feature_set": "timeonly"}):
+        with pytest.raises(ValueError, match="placebo run"):
+            ExperimentConfig(placebo_weather=1, **option)
+
+
+def test_unweighted_run_fits_without_weights_and_rescales_from_the_fit_shares(synthetic_study, monkeypatch):
+    import src.train_models as tm
+    class_weights = []
+    original = tm.SeverityModel.__init__
+
+    def recording_init(self, name, params, numeric, categorical, seed=tm.RANDOM_STATE):
+        class_weights.append(params.get("class_weight", "balanced"))
+        original(self, name, params, numeric, categorical, seed)
+
+    monkeypatch.setattr(tm.SeverityModel, "__init__", recording_init)
+    df, hourly = synthetic_study
+    fold = expanding_folds()[-1]
+    budget = dict(n_candidates=1, bootstrap_replicates=20)
+    weighted = run_folds(df, hourly, "logistic", ExperimentConfig(**budget), folds=[fold], verbose=False)
+    assert class_weights == ["balanced", "balanced"]
+    unweighted = run_folds(df, hourly, "logistic", ExperimentConfig(class_weights=False, **budget), folds=[fold],
+                           verbose=False)
+    assert class_weights[2:] == [None, None]
+    priors = ["prior0", "prior1", "prior2"]
+    fit_classes = fold_frames(df, hourly, fold)["fit"]["severidad"].to_numpy()
+    assert np.allclose(weighted["candidates"][priors], 1 / 3)
+    assert np.allclose(unweighted["candidates"][priors], np.bincount(fit_classes, minlength=3) / len(fit_classes))
+    raw = ["p0", "p1", "p2"]
+    assert not np.allclose(weighted["predictions"][raw], unweighted["predictions"][raw])
+    # Without weights the raw probabilities follow the class shares instead of a uniform prior.
+    assert unweighted["predictions"]["p2"].mean() < weighted["predictions"]["p2"].mean()
+
+
+def test_placebo_keeps_the_weather_of_every_station_month_and_hour(synthetic_study):
+    df, hourly = synthetic_study
+    observed = previous_hour_weather(df, hourly)
+    placebo = placebo_weather(observed, seed=1)
+    untouched = [c for c in observed.columns if c not in WEATHER_SOURCE]
+    pd.testing.assert_frame_equal(placebo[untouched], observed[untouched], check_exact=True)
+    assert (placebo.dtypes == observed.dtypes).all()
+
+    # Within every station x month x hour cell, the days with crashes carry the
+    # observed weather records, whole (all the variables together), on other days.
+    cell = ["estacion_climatica_utilizada", CLIMATE_MONTH, CLIMATE_HOUR]
+    per_day = [frame.drop_duplicates(cell + ["fecha"]).sort_values(cell + WEATHER_SOURCE)[cell + WEATHER_SOURCE]
+               .reset_index(drop=True) for frame in (observed, placebo)]
+    pd.testing.assert_frame_equal(per_day[0], per_day[1], check_exact=True)
+
+    # Crashes of the same cell and day share the weather before and after.
+    assert (placebo.groupby(cell + ["fecha"])[WEATHER_SOURCE].nunique() == 1).all().all()
+
+    # Every day receives the record of another day of its cell (the synthetic
+    # temperatures are all different, so they identify the day they come from).
+    origin = observed.drop_duplicates(cell + ["fecha"]).set_index(cell + ["tmp"])["fecha"]
+    source = origin.reindex(pd.MultiIndex.from_frame(placebo[cell + ["tmp"]])).to_numpy()
+    assert pd.notna(source).all()
+    alone = observed.groupby(cell)["fecha"].transform("nunique").to_numpy() == 1
+    assert ((source != placebo["fecha"].to_numpy()) | alone).all() and alone.mean() < 0.05
+    assert (pd.to_datetime(pd.Series(source)).dt.year.to_numpy() != pd.to_datetime(placebo["fecha"]).dt.year).mean() > 0.5
+
+    pd.testing.assert_frame_equal(placebo, placebo_weather(observed, seed=1), check_exact=True)
+    assert not placebo_weather(observed, seed=2)["tmp"].equals(placebo["tmp"])
+
+
+def test_placebo_run_changes_the_weather_and_leaves_the_baseline_untouched(synthetic_study):
+    df, hourly = synthetic_study
+    fold = expanding_folds()[-1]
+    crashes = previous_hour_weather(df, hourly)
+    observed = fold_frames(crashes, hourly, fold)
+    placebo = fold_frames(placebo_weather(crashes, seed=2), hourly, fold)
+    untouched = BASE_NUMERIC + BASE_CATEGORICAL + ["severidad"]
+    for split in ("fit", "val", "eval"):
+        pd.testing.assert_frame_equal(observed[split][untouched], placebo[split][untouched], check_exact=True)
+        assert not np.allclose(observed[split]["tmp_anom"], placebo[split]["tmp_anom"])
+        assert abs(np.corrcoef(observed[split]["tmp_anom"], placebo[split]["tmp_anom"])[0, 1]) < 0.15
+
+    # End to end: the placebo run fits the same baseline and another enriched model.
+    budget = dict(n_candidates=1, bootstrap_replicates=20)
+    main_run = run_folds(df, hourly, "logistic", ExperimentConfig(**budget), folds=[fold], verbose=False)
+    placebo_run = run_folds(df, hourly, "logistic", ExperimentConfig(placebo_weather=2, **budget), folds=[fold],
+                            verbose=False)
+    raw = ["row", "split", "p0", "p1", "p2"]
+    predictions = [run["predictions"] for run in (main_run, placebo_run)]
+    baseline = [frame.query("config == 'base'")[raw].reset_index(drop=True) for frame in predictions]
+    enriched = [frame.query("config == 'enriched'")[raw].reset_index(drop=True) for frame in predictions]
+    pd.testing.assert_frame_equal(baseline[0], baseline[1], check_exact=True)
+    assert not np.allclose(enriched[0][["p0", "p1", "p2"]], enriched[1][["p0", "p1", "p2"]])
 
 
 def test_reading_of_the_test_run_only_asks_whether_the_interval_contains_zero():

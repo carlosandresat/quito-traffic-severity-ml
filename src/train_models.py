@@ -38,7 +38,16 @@ training window, the weather mark, raw weather, independent hyperparameters, the
 dispatch scenario (crash type and vehicle counts in both configurations), the
 restriction to direct weather assignments (fit, validation and evaluation rows)
 and SMOTE-NC instead of class weights (synthetic rows in the fit years only, with
-the decision stage rescaling from the resampled class shares).
+the decision stage rescaling from the resampled class shares), and no class
+weights at all (the decision stage rescaling from the class shares of the fit
+rows).
+
+A placebo run (``placebo_weather``) repeats the whole procedure with the weather
+block exchanged between days within each station x month x hour cell: every
+crash keeps its station, month and hour and receives the weather of another day
+with crashes in that cell, so the weather block keeps the distribution the
+models see and carries no information about the crash. Its difference in macro
+F1 is the one the procedure yields when the weather cannot inform.
 
 The minimal baselines are runs of their own (``feature_set``) that use no
 weather: a set with only the hour and the day, or only the place, takes the
@@ -92,8 +101,8 @@ from src.climatology import StationClimatology
 from src.decision import (EPSILON, DecisionRule, expected_calibration_error, macro_f1_from_labels,
                           multiclass_log_loss)
 from src.eda_statistics import holm_adjust
-from src.features import (MINIMAL_FEATURE_SETS, TARGET, build_feature_frame, feature_columns,
-                          previous_hour_weather)
+from src.features import (CLIMATE_HOUR, CLIMATE_MONTH, MINIMAL_FEATURE_SETS, TARGET, WEATHER_SOURCE,
+                          build_feature_frame, feature_columns, previous_hour_weather)
 from src.folds import MAIN_WINDOW_START, UNEVALUATED_MONTHS, TemporalFold, expanding_folds, holdout_fold
 
 RANDOM_STATE: int = 20261024
@@ -206,6 +215,14 @@ class ExperimentConfig:
         'full' for the comparison of the baseline with the enriched model;
         'timeonly' or 'spaceonly' for a minimal-baseline run, which contrasts
         that minimal set with the full baseline and uses no weather.
+    class_weights : bool
+        Weight the classes when fitting (the main design). Without weights the
+        decision stage rescales from the class shares of the fit rows
+        (sensitivity analysis).
+    placebo_weather : Optional[int]
+        Seed of a placebo run, in which the weather block is exchanged between
+        days within each station x month x hour cell (see ``placebo_weather``);
+        None for the observed weather.
     """
 
     models: List[str] = field(default_factory=lambda: list(MODELS))
@@ -221,10 +238,17 @@ class ExperimentConfig:
     smote_nc: bool = False
     holdout: bool = False
     feature_set: str = "full"
+    class_weights: bool = True
+    placebo_weather: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.feature_set not in FEATURE_SETS:
             raise ValueError(f"Unknown feature set: {self.feature_set}")
+        if self.smote_nc and not self.class_weights:
+            raise ValueError("SMOTE-NC already fits without class weights: the two options cannot be combined.")
+        if self.placebo_weather is not None and (self.crash_hour_weather or self.feature_set != "full"):
+            raise ValueError("A placebo run exchanges the weather of the previous mark: it cannot be combined "
+                             "with the crash-hour weather nor with a minimal baseline, which uses none.")
         if self.feature_set != "full" and (self.raw_weather or self.crash_hour_weather
                                            or self.dispatch_scenario or self.smote_nc):
             raise ValueError("A minimal-baseline run uses no weather and no dispatch field and is not "
@@ -245,6 +269,10 @@ class ExperimentConfig:
             label += "_directonly"
         if self.smote_nc:
             label += "_smotenc"
+        if not self.class_weights:
+            label += "_unweighted"
+        if self.placebo_weather is not None:
+            label += f"_placebo{self.placebo_weather}"
         if self.feature_set != "full":
             label += f"_{self.feature_set}"
         if self.holdout:
@@ -717,6 +745,53 @@ def model_columns(model: str, config: str, raw_weather: bool, dispatch: bool = F
     return cols["numeric"], cols["categorical"]
 
 
+def placebo_weather(df: pd.DataFrame, seed: int) -> pd.DataFrame:
+    """Crashes with the weather block exchanged between days within each station x month x hour cell.
+
+    A cell is the station that supplied the weather and the month and hour of
+    the weather mark, the keys of the climatology. Within each cell the days
+    with crashes are put in a random order and every day receives the weather
+    block of the next one, cyclically, so no day keeps its own unless it is the
+    only one of its cell. All the weather variables of a mark move together, and
+    crashes of the same cell and day, which share the mark, still share it.
+
+    The weather records of each cell are therefore the observed ones attached to
+    other days: the distribution of the block by station, month and hour is the
+    one the models see with the observed weather, and its link with the outcome
+    of each crash is broken. Days of different years are exchanged, so the block
+    does not mark the period either. The climatology is not affected.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Crashes after ``previous_hour_weather``.
+    seed : int
+        Seed of the exchange.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of ``df`` with the columns of ``WEATHER_SOURCE`` exchanged.
+    """
+    keys = pd.DataFrame({"station": df["estacion_climatica_utilizada"].astype(str).to_numpy(),
+                         "month": df[CLIMATE_MONTH].to_numpy(), "hour": df[CLIMATE_HOUR].to_numpy(),
+                         "day": pd.to_datetime(df["fecha"]).dt.normalize().to_numpy()})
+    cell = ["station", "month", "hour"]
+    day_id = keys.groupby(cell + ["day"], sort=True).ngroup().to_numpy()
+    # One entry per cell and day, in the order of ``day_id``: its cell and one of its crashes.
+    days = pd.DataFrame({"cell": keys.groupby(cell, sort=True).ngroup().to_numpy(),
+                         "position": np.arange(len(df))}).groupby(day_id).first()
+    days["draw"] = np.random.default_rng(seed).random(len(days))
+    ordered = days.sort_values(["cell", "draw"])
+    rank = ordered.groupby("cell").cumcount().to_numpy()
+    size = ordered.groupby("cell")["position"].transform("size").to_numpy()
+    next_in_cell = np.arange(len(ordered)) - rank + (rank + 1) % size
+    source = pd.Series(ordered["position"].to_numpy()[next_in_cell], index=ordered.index)
+    out = df.copy()
+    out[WEATHER_SOURCE] = df[WEATHER_SOURCE].to_numpy()[source.loc[day_id].to_numpy()]
+    return out
+
+
 def experiment_folds(config: ExperimentConfig) -> List[TemporalFold]:
     """Folds of a run: the single test fold of 2026, or the expanding-origin folds."""
     if config.holdout:
@@ -867,6 +942,8 @@ def run_folds(
     dates = pd.to_datetime(df["fecha"]).dt.strftime("%Y-%m-%d")
     if not config.crash_hour_weather:
         df = previous_hour_weather(df, hourly)
+    if config.placebo_weather is not None:
+        df = placebo_weather(df, config.placebo_weather)
     tuning_rows, metric_rows, delta_rows, prediction_frames, pooled_input = [], [], [], [], []
     trivial_rows: List[Dict[str, Any]] = []
     candidate_frames: List[pd.DataFrame] = []
@@ -891,7 +968,8 @@ def run_folds(
         fitted: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for i, params in enumerate(candidates):
             row = {"model": model, "fold": fold.name, "candidate": i, "params": repr(params)}
-            learner_params = {**params, "class_weight": None} if config.smote_nc else params
+            unweighted = config.smote_nc or not config.class_weights
+            learner_params = {**params, "class_weight": None} if unweighted else params
             for cfg in CONFIGS:
                 numeric, categorical = model_columns(model, cfg, config.raw_weather, config.dispatch_scenario,
                                                      config.feature_set)
@@ -1217,6 +1295,11 @@ if __name__ == "__main__":
                         help="Keep only crashes with a direct weather assignment (sensitivity).")
     parser.add_argument("--smote-nc", action="store_true",
                         help="Oversample the fit rows with SMOTE-NC instead of class weights (sensitivity).")
+    parser.add_argument("--no-class-weights", action="store_true",
+                        help="Fit without class weights (sensitivity).")
+    parser.add_argument("--placebo-weather", type=int, default=None, metavar="SEED",
+                        help="Placebo run: exchange the weather block between days within each station x "
+                             "month x hour cell, with this seed.")
     parser.add_argument("--feature-set", choices=FEATURE_SETS, default="full",
                         help="Minimal-baseline run: contrast the hour-and-day set or the place set with "
                              "the full baseline, without weather.")
@@ -1233,5 +1316,6 @@ if __name__ == "__main__":
                           crash_hour_weather=args.crash_hour_weather,
                           dispatch_scenario=args.dispatch_scenario,
                           direct_assignment_only=args.direct_assignment_only, smote_nc=args.smote_nc,
-                          holdout=args.holdout, feature_set=args.feature_set),
+                          holdout=args.holdout, feature_set=args.feature_set,
+                          class_weights=not args.no_class_weights, placebo_weather=args.placebo_weather),
          summarize_only=args.summarize_only)
