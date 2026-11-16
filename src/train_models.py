@@ -715,6 +715,10 @@ def run_folds(
         date of each crash as its resampling block).
     """
     folds = folds or expanding_folds(config.first_train_year)
+    if not any(fold.last_train_year > fold.first_train_year for fold in folds):
+        raise ValueError(
+            "No fold has a fit year and a validation year: every fold needs at least two "
+            f"training years (first training year: {config.first_train_year}).")
     candidates = candidate_params(model, config.n_candidates, config.seed)
     dates = pd.to_datetime(df["fecha"]).dt.strftime("%Y-%m-%d")
     if not config.crash_hour_weather:

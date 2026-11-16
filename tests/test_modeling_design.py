@@ -182,6 +182,19 @@ def test_sensitivity_windows_run_the_folds_they_can_validate():
     assert [f.eval_year for f in expanding_folds(2022)] == [2024, 2025]
 
 
+def test_a_run_without_any_validation_year_fails_with_a_clear_message():
+    from src.folds import TemporalFold
+    from src.train_models import run_folds
+    empty = pd.DataFrame()
+    assert expanding_folds(2024) == []
+    with pytest.raises(ValueError, match=r"No fold has a fit year and a validation year.*2024"):
+        run_folds(empty, empty, "logistic", ExperimentConfig(first_train_year=2024))
+    # A fold with a single training year has no validation period either.
+    with pytest.raises(ValueError, match="at least two training years"):
+        run_folds(empty, empty, "logistic", ExperimentConfig(),
+                  folds=[TemporalFold("2024-2024->2025", 2024, 2024, 2025)])
+
+
 def test_fold_sizes_on_the_integrated_dataset(integrated_df):
     fatal = []
     for fold in expanding_folds():
