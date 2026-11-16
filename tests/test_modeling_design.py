@@ -553,6 +553,36 @@ def test_smote_nc_balances_the_classes_and_keeps_the_original_rows():
         pytest.approx(1 / 3)
 
 
+def test_smote_nc_neighbours_do_not_depend_on_the_scale_of_the_features():
+    """The minority class forms two groups along a feature of small scale, next
+    to an uninformative feature of large scale. Without standardization the
+    large one alone decides the neighbours, and the synthetic rows fall between
+    the groups."""
+    rng = np.random.default_rng(11)
+    n, minority = 600, 120
+    y = np.r_[np.zeros(n - minority, dtype=int), np.ones(minority, dtype=int)]
+    group = np.where(rng.random(n) < 0.5, -5.0, 5.0)
+    frame = pd.DataFrame({
+        "small": group + rng.normal(scale=0.2, size=n),
+        "large": rng.normal(scale=1000.0, size=n),
+        "es_feriado": rng.integers(0, 2, n).astype(float),
+        "fin_de_semana": 0.0,
+        "dia_semana": pd.Series(rng.integers(1, 6, n)).astype(str),
+    })
+    numeric, categorical = ["small", "large", "es_feriado", "fin_de_semana"], ["dia_semana"]
+    resampled, y_new = smote_nc_resample(frame, y, numeric, categorical)
+    synthetic = resampled.iloc[n:]
+    assert len(synthetic) == n - 2 * minority and (y_new[n:] == 1).all()
+    assert (synthetic["small"].abs() < 4.0).mean() < 0.05
+    # Synthetic rows come back in the original units, inside the range of their class.
+    assert synthetic["large"].between(frame.loc[y == 1, "large"].min(), frame.loc[y == 1, "large"].max()).all()
+    assert synthetic["large"].std() > 100.0
+    # The original rows are returned bit for bit.
+    assert np.array_equal(resampled[numeric].iloc[:n].to_numpy(), frame[numeric].to_numpy())
+    assert resampled["dia_semana"].iloc[:n].tolist() == frame["dia_semana"].tolist()
+    assert np.array_equal(y_new[:n], y)
+
+
 def test_sensitivity_labels_keep_their_results_apart():
     assert ExperimentConfig().label == "anomalies"
     assert ExperimentConfig(dispatch_scenario=True).label == "anomalies_dispatch"

@@ -672,6 +672,10 @@ def smote_nc_resample(X: pd.DataFrame, y: np.ndarray, numeric: List[str], catego
                       seed: int = RANDOM_STATE) -> Tuple[pd.DataFrame, np.ndarray]:
     """Oversamples the minority classes of the fit rows up to the majority with SMOTE-NC.
 
+    The neighbours are searched on the standardized continuous features (mean and
+    standard deviation of the fit rows), so that every feature weighs the same in
+    the distance; the synthetic rows are returned in the original units.
+
     Parameters
     ----------
     X : pd.DataFrame
@@ -686,16 +690,27 @@ def smote_nc_resample(X: pd.DataFrame, y: np.ndarray, numeric: List[str], catego
     Returns
     -------
     Tuple[pd.DataFrame, np.ndarray]
-        Original and synthetic rows and their classes, with balanced classes. The
-        weekend flag of the synthetic rows is derived from their weekday, which
-        SMOTE-NC would otherwise draw separately. Cyclic features are interpolated
-        as they are, so a synthetic hour may fall off the unit circle.
+        Original rows, unaltered, followed by the synthetic ones, and their
+        classes, with balanced classes. The weekend flag of the synthetic rows is
+        derived from their weekday, which SMOTE-NC would otherwise draw
+        separately. Cyclic features are interpolated as they are, so a synthetic
+        hour may fall off the unit circle.
     """
     columns = numeric + categorical
     nominal = [c for c in numeric if c in BINARY_FEATURES] + categorical
+    # SMOTE-NC measures Euclidean distances on the numeric columns as they are, so
+    # they are standardized for the neighbour search and restored afterwards;
+    # otherwise the feature with the largest variance alone decides the neighbours.
+    continuous = [c for c in numeric if c not in BINARY_FEATURES]
+    scaler = StandardScaler().fit(X[continuous])
     # imbalanced-learn needs object columns to recognize the categories.
     frame = X[columns].astype({c: object for c in categorical})
+    frame[continuous] = scaler.transform(X[continuous])
     resampled, y_resampled = SMOTENC(categorical_features=nominal, random_state=seed).fit_resample(frame, y)
+    resampled[continuous] = scaler.inverse_transform(resampled[continuous])
+    # The original rows come first; they are written back so that the round trip
+    # through the scaler does not alter their last bits.
+    resampled.iloc[:len(X), [resampled.columns.get_loc(c) for c in continuous]] = X[continuous].to_numpy()
     resampled["fin_de_semana"] = resampled["dia_semana"].isin(["6", "7"]).astype(float)
     return resampled, y_resampled
 
