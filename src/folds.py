@@ -7,9 +7,10 @@ models fitted from 2017 had a lower log loss than models fitted from 2019 for
 most learners and both configurations, so the earlier years add more than
 their drift costs; windows starting in 2019 and 2022 are sensitivity analyses.
 Every evaluated period lies after the change. Months without valid source data are never
-evaluated: October–December 2023 are absent from the source, and December 2024
-keeps only national police records because the municipal coordinates of that
-month were voided.
+evaluated, and ``src.train_models.fold_frames`` keeps them out of the fit and
+validation rows too: October–December 2023 are absent from the source, and
+December 2024 keeps only national police records because the municipal
+coordinates of that month were voided.
 
 The expanding-origin folds are the main evidence of the study: with 174 fatal
 crashes in the test period alone, the 95% interval of the fatal recall spans
@@ -99,7 +100,8 @@ def holdout_fold(first_train_year: int = MAIN_WINDOW_START) -> TemporalFold:
 
     It has the structure of every expanding-origin fold, so the decision stage
     is fitted on 2025 and the test period is never used to fit anything. It is
-    evaluated once, at the end, by an explicit call; ``expanding_folds`` never
-    returns it.
+    evaluated once, at the end, by a run of its own (the ``holdout`` option of
+    ``src.train_models``); ``expanding_folds`` never returns it. December 2024,
+    a month without valid source data, is left out of its fit rows.
     """
     return TemporalFold(f"{first_train_year}-2025->2026", first_train_year, 2025, 2026)

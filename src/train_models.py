@@ -39,6 +39,11 @@ dispatch scenario (crash type and vehicle counts in both configurations), the
 restriction to direct weather assignments (fit, validation and evaluation rows)
 and SMOTE-NC instead of class weights (synthetic rows in the fit years only, with
 the decision stage rescaling from the resampled class shares).
+
+The test of January-July 2026 is a run of its own (``holdout``): one fold fitted
+up to 2024 and validated on 2025, written under its own label so that it cannot
+overwrite the results of the folds, and contrasted as a single period. No other
+run evaluates 2026.
 """
 
 import argparse
@@ -81,7 +86,7 @@ from src.decision import (EPSILON, DecisionRule, expected_calibration_error, mac
                           multiclass_log_loss)
 from src.eda_statistics import holm_adjust
 from src.features import TARGET, build_feature_frame, feature_columns, previous_hour_weather
-from src.folds import MAIN_WINDOW_START, UNEVALUATED_MONTHS, TemporalFold, expanding_folds
+from src.folds import MAIN_WINDOW_START, UNEVALUATED_MONTHS, TemporalFold, expanding_folds, holdout_fold
 
 RANDOM_STATE: int = 20261024
 CLASSES: List[int] = [0, 1, 2]
@@ -185,6 +190,9 @@ class ExperimentConfig:
     smote_nc : bool
         Oversample the fit rows with SMOTE-NC instead of weighting the classes
         (sensitivity analysis).
+    holdout : bool
+        Run the single test fold (fit up to 2024, validate on 2025, evaluate
+        January-July 2026) instead of the expanding-origin folds.
     """
 
     models: List[str] = field(default_factory=lambda: list(MODELS))
@@ -198,6 +206,7 @@ class ExperimentConfig:
     dispatch_scenario: bool = False
     direct_assignment_only: bool = False
     smote_nc: bool = False
+    holdout: bool = False
 
     @property
     def label(self) -> str:
@@ -214,6 +223,8 @@ class ExperimentConfig:
             label += "_directonly"
         if self.smote_nc:
             label += "_smotenc"
+        if self.holdout:
+            label += "_holdout"
         # A run with another budget or seed writes to its own files, so it cannot
         # overwrite the results of the study defaults nor be mixed with them.
         if (self.n_candidates, self.bootstrap_replicates, self.seed) != (
@@ -528,6 +539,19 @@ def contrast_reading(ci95_low: float, ci95_high: float, ci90_low: float, ci90_hi
     return "equivalent" if equivalent else "inconclusive"
 
 
+def holdout_reading(ci95_low: float, ci95_high: float) -> str:
+    """Pre-specified reading of the difference in macro F1 on the 2026 test.
+
+    The test is descriptive: a single period is too small to read the equivalence
+    margin on it, so its difference is only said to be compatible with the result
+    of the folds when the 95% interval contains zero, and reported as it is
+    otherwise. Neither outcome changes the conclusion of the folds.
+    """
+    if ci95_low > 0 or ci95_high < 0:
+        return "95% interval excludes zero"
+    return "compatible with the folds"
+
+
 def pooled_bootstrap_contrast(
     folds: List[FoldPredictions],
     n_replicates: int = BOOTSTRAP_REPLICATES,
@@ -608,13 +632,23 @@ def model_columns(model: str, config: str, raw_weather: bool, dispatch: bool = F
     return cols["numeric"], cols["categorical"]
 
 
+def experiment_folds(config: ExperimentConfig) -> List[TemporalFold]:
+    """Folds of a run: the single test fold of 2026, or the expanding-origin folds."""
+    if config.holdout:
+        return [holdout_fold(config.first_train_year)]
+    return expanding_folds(config.first_train_year)
+
+
 def fold_frames(df: pd.DataFrame, hourly: pd.DataFrame, fold: TemporalFold, dispatch: bool = False,
                 direct_only: bool = False) -> Optional[Dict[str, pd.DataFrame]]:
     """Fit, validation and evaluation frames of a fold.
 
     The model is fitted on the training years except the last one, which is the
     validation period. The climatology and the cell exposure are fitted on the
-    fit years only. With ``direct_only``, the three frames keep the crashes with
+    fit years only. Months without valid source data (``UNEVALUATED_MONTHS``)
+    enter no frame; among the fit years of the folds only the test fold has such
+    rows, the 14 national police records of December 2024.
+    With ``direct_only``, the three frames keep the crashes with
     a direct weather assignment, while the cell exposure still counts every crash
     of the fit years, so the features mean the same as in the main design.
     Returns None when the fold has a single training year and therefore no
@@ -624,7 +658,8 @@ def fold_frames(df: pd.DataFrame, hourly: pd.DataFrame, fold: TemporalFold, disp
         return None
     dates = pd.to_datetime(df["fecha"])
     years, months = dates.dt.year, dates.dt.to_period("M").astype(str)
-    fit_mask = (years >= fold.first_train_year) & (years <= fold.last_train_year - 1)
+    fit_mask = ((years >= fold.first_train_year) & (years <= fold.last_train_year - 1)
+                & ~months.isin(UNEVALUATED_MONTHS))
     val_mask = (years == fold.last_train_year) & ~months.isin(UNEVALUATED_MONTHS)
     _, eval_mask = fold.masks(df)
     climatology = StationClimatology.fit(hourly, last_year=fold.last_train_year - 1)
@@ -700,7 +735,8 @@ def run_folds(
     config : ExperimentConfig
         Run parameters.
     folds : Optional[List[TemporalFold]]
-        Folds; defaults to the expanding-origin folds of ``config``.
+        Folds; defaults to those of ``config`` (the expanding-origin folds or,
+        for the test run, the single fold that evaluates 2026).
     verbose : bool
         Print progress per fold.
 
@@ -714,7 +750,7 @@ def run_folds(
         probabilities and decided classes of the selected candidates, with the
         date of each crash as its resampling block).
     """
-    folds = folds or expanding_folds(config.first_train_year)
+    folds = folds or experiment_folds(config)
     if not any(fold.last_train_year > fold.first_train_year for fold in folds):
         raise ValueError(
             "No fold has a fit year and a validation year: every fold needs at least two "
@@ -829,7 +865,9 @@ def confirmatory_contrast(
         and, as a sensitivity, over the folds that do not evaluate 2025, with
         Holm over the two secondary statistics, log loss and fatal PR-AUC); and
         'secondary' (pooled difference in macro F1 of each learner, with Holm
-        over the four learners).
+        over the four learners). The test run has a single period: 'primary' has
+        one row, no count of positive periods is given, the difference is read
+        with ``holdout_reading`` and the differences by learner are descriptive.
     """
     models = models or list(MODELS)
     tuning = pd.concat([pd.read_csv(report_dir / f"{m}_tuning_{config.label}.csv") for m in models],
@@ -862,18 +900,28 @@ def confirmatory_contrast(
                 base[["c0", "c1", "c2"]].to_numpy(), enr[["c0", "c1", "c2"]].to_numpy()))
         return inputs
 
+    def contrast(inputs: List[FoldPredictions]) -> Dict[str, Any]:
+        out = pooled_bootstrap_contrast(inputs, config.bootstrap_replicates, config.seed)
+        if config.holdout:
+            del out["folds_positive"]
+            out["reading"] = holdout_reading(out["delta_f1_macro_ci95_low"], out["delta_f1_macro_ci95_high"])
+        return out
+
     chosen_learner = dict(zip(selection["fold"], selection["model"]))
-    subsets = {"all folds": list(chosen_learner),
-               "folds not evaluating 2025": [f for f in chosen_learner if _fold_eval_year(f) != 2025]}
+    if config.holdout:
+        subsets = {"holdout": list(chosen_learner)}
+    else:
+        subsets = {"all folds": list(chosen_learner),
+                   "folds not evaluating 2025": [f for f in chosen_learner if _fold_eval_year(f) != 2025]}
     primary = []
     for label, fold_names in subsets.items():
-        row = {"contrast": "learner selected on validation", "folds": label, **pooled_bootstrap_contrast(
-            fold_inputs({f: chosen_learner[f] for f in fold_names}), config.bootstrap_replicates, config.seed)}
+        row = {"contrast": "learner selected on validation", "folds": label,
+               **contrast(fold_inputs({f: chosen_learner[f] for f in fold_names}))}
         holm = holm_adjust(np.array([row["delta_log_loss_p_value"], row["delta_pr_auc_2_p_value"]]))
         row["delta_log_loss_p_holm"], row["delta_pr_auc_2_p_holm"] = holm
         primary.append(row)
-    secondary = pd.DataFrame([{"model": m, **pooled_bootstrap_contrast(
-        fold_inputs({f: m for f in chosen_learner}), config.bootstrap_replicates, config.seed)} for m in models])
+    secondary = pd.DataFrame([{"model": m, **contrast(fold_inputs({f: m for f in chosen_learner}))}
+                              for m in models])
     secondary["delta_f1_macro_p_holm"] = holm_adjust(secondary["delta_f1_macro_p_value"].to_numpy())
     return {"selection": selection, "primary": pd.DataFrame(primary), "secondary": secondary}
 
@@ -1042,6 +1090,9 @@ if __name__ == "__main__":
                         help="Keep only crashes with a direct weather assignment (sensitivity).")
     parser.add_argument("--smote-nc", action="store_true",
                         help="Oversample the fit rows with SMOTE-NC instead of class weights (sensitivity).")
+    parser.add_argument("--holdout", action="store_true",
+                        help="Run the test of January-July 2026 (fit to 2024, validate on 2025) instead "
+                             "of the folds.")
     parser.add_argument("--summarize-only", action="store_true",
                         help="Only compute the confirmatory contrast from saved results.")
     args = parser.parse_args()
@@ -1051,5 +1102,6 @@ if __name__ == "__main__":
                           shared_hyperparameters=not args.independent_hyperparameters,
                           crash_hour_weather=args.crash_hour_weather,
                           dispatch_scenario=args.dispatch_scenario,
-                          direct_assignment_only=args.direct_assignment_only, smote_nc=args.smote_nc),
+                          direct_assignment_only=args.direct_assignment_only, smote_nc=args.smote_nc,
+                          holdout=args.holdout),
          summarize_only=args.summarize_only)

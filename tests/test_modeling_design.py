@@ -1,6 +1,8 @@
 """Tests for the modeling design: feature governance, folds and the paired bootstrap."""
 
+import itertools
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,7 +31,9 @@ from src.train_models import (
     candidate_params,
     confirmatory_contrast,
     contrast_reading,
+    experiment_folds,
     fold_frames,
+    holdout_reading,
     pooled_bootstrap_contrast,
     run_metadata,
     selected_candidates,
@@ -193,6 +197,86 @@ def test_a_run_without_any_validation_year_fails_with_a_clear_message():
     with pytest.raises(ValueError, match="at least two training years"):
         run_folds(empty, empty, "logistic", ExperimentConfig(),
                   folds=[TemporalFold("2024-2024->2025", 2024, 2024, 2025)])
+
+
+def _synthetic_study(n: int = 3000, seed: int = 0) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Crash table and hourly grid from 2017 to July 2026, with crashes in every month."""
+    rng = np.random.default_rng(seed)
+    hours = pd.date_range("2017-01-01", "2026-07-31 23:00", freq="h")
+    stations = ["Belisario", "Tumbaco"]
+    hourly = pd.concat([pd.DataFrame({"estacion": name, "fecha_hora": hours,
+                                      **{v: rng.normal(size=len(hours)) for v in WEATHER_SOURCE}})
+                        for name in stations], ignore_index=True)
+    when = pd.Series(rng.choice(hours, n)).sort_values(ignore_index=True)
+    station = rng.choice(stations, n)
+    df = pd.DataFrame({
+        "fecha": when.dt.strftime("%Y-%m-%d"), "hora": when.dt.hour, "mes": when.dt.month,
+        "dia_semana": when.dt.dayofweek + 1, "es_feriado": 0, "periodo_movilidad": "x",
+        "lat": -0.2 + rng.uniform(-0.1, 0.1, n), "lon": -78.5 + rng.uniform(-0.1, 0.1, n),
+        "estacion_geografica_mas_cercana": station,
+        "distancia_geografica_mas_cercana_km": rng.uniform(0.0, 5.0, n),
+        "estacion_climatica_utilizada": station,
+        "asignacion_clima": rng.choice(["directa", "fallback"], n, p=[0.9, 0.1]),
+        **{v: rng.normal(size=n) for v in WEATHER_SOURCE},
+        "id_siniestro": [f"DMQ{i}" for i in range(n)],
+        "severidad": rng.choice([0, 1, 2], n, p=[0.5, 0.4, 0.1]),
+    })
+    return df, hourly
+
+
+@pytest.fixture(scope="module")
+def synthetic_study() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    return _synthetic_study()
+
+
+def test_test_run_has_its_own_label_and_no_other_run_selects_its_fold():
+    assert ExperimentConfig(holdout=True).label == "anomalies_holdout"
+    flags = ("raw_weather", "crash_hour_weather", "dispatch_scenario", "direct_assignment_only", "smote_nc",
+             "shared_hyperparameters")
+    for first in (2017, 2019, 2022):
+        for values in itertools.product((False, True), repeat=len(flags)):
+            options = dict(zip(flags, values), first_train_year=first)
+            folds = experiment_folds(ExperimentConfig(**options))
+            assert folds == expanding_folds(first) and all(fold.eval_year <= 2025 for fold in folds)
+            test_run = ExperimentConfig(holdout=True, **options)
+            assert experiment_folds(test_run) == [holdout_fold(first)]
+            assert test_run.label == ExperimentConfig(**options).label + "_holdout"
+    assert ExperimentConfig(holdout=True, seed=1).label.startswith("anomalies_holdout_c")
+
+
+def test_only_the_test_run_produces_rows_of_2026(synthetic_study):
+    df, hourly = synthetic_study
+    dates = pd.to_datetime(df["fecha"])
+    years, months = dates.dt.year, dates.dt.to_period("M").astype(str)
+    no_data = months.isin(UNEVALUATED_MONTHS)
+    assert (years == 2026).any() and all((months == month).any() for month in UNEVALUATED_MONTHS)
+    for first in (2017, 2019, 2022):
+        for fold in experiment_folds(ExperimentConfig(first_train_year=first)):
+            for direct_only in (False, True):
+                frames = fold_frames(df, hourly, fold, direct_only=direct_only)
+                for frame in frames.values():
+                    assert len(frame) > 0 and years[frame.index].max() <= 2025
+                    assert not no_data[frame.index].any()
+                assert set(years[frames["eval"].index]) == {fold.eval_year}
+    frames = fold_frames(df, hourly, experiment_folds(ExperimentConfig(holdout=True))[0])
+    assert set(years[frames["eval"].index]) == {2026} and set(years[frames["val"].index]) == {2025}
+    # The fit rows are every crash up to 2024 except those of the months without source data.
+    assert frames["fit"].index.equals(df.index[(years <= 2024) & ~no_data])
+    assert (years <= 2024).sum() > len(frames["fit"])
+
+
+def test_frame_sizes_of_the_folds_and_of_the_test_on_the_integrated_dataset(integrated_df, remmaq_df):
+    """The folds keep the sizes of the runs of 30-oct-2026; the test fold leaves
+    the 14 records of December 2024 out of its fit rows."""
+    expected = {"2017-2021->2022": (23771, 3411, 3394), "2017-2022->2023": (27182, 3394, 2769),
+                "2017-2023->2024": (30576, 2769, 3542), "2017-2024->2025": (33345, 3542, 3987),
+                "2017-2025->2026": (36887, 3987, 2356)}
+    years = pd.to_datetime(integrated_df["fecha"]).dt.year
+    for fold in expanding_folds() + [holdout_fold()]:
+        frames = fold_frames(integrated_df, remmaq_df, fold)
+        assert tuple(len(frames[split]) for split in ("fit", "val", "eval")) == expected[fold.name]
+        assert (years[frames["eval"].index] == 2026).all() == (fold.eval_year == 2026)
+    assert [int((frames[split]["severidad"] == 2).sum()) for split in ("fit", "val", "eval")] == [1887, 314, 174]
 
 
 def test_fold_sizes_on_the_integrated_dataset(integrated_df):
@@ -363,6 +447,64 @@ def test_contrast_selects_the_learner_on_validation_only(tmp_path):
     assert (secondary["delta_f1_macro_p_holm"] >= secondary["delta_f1_macro_p_value"]).all()
     summary = train_main(config, report_dir=tmp_path, prediction_dir=tmp_path, summarize_only=True)
     assert "contrast" in summary and (tmp_path / f"contrast_primary_{config.label}.csv").exists()
+
+
+def test_test_run_is_contrasted_as_a_single_period(tmp_path):
+    rng = np.random.default_rng(7)
+    config = ExperimentConfig(holdout=True, bootstrap_replicates=50)
+    fold = holdout_fold().name
+    y = rng.integers(0, 3, 300)
+    same = rng.integers(0, 3, 300)
+    proba = np.full((300, 3), 1 / 3)
+    for model in MODELS:
+        score = 0.5 if model == "lightgbm" else 0.3
+        pd.DataFrame({"model": model, "fold": [fold], "candidate": 0, "params": "{}", "val_f1_base": score,
+                      "val_f1_enriched": score, "val_f1_mean": score}).to_csv(
+            tmp_path / f"{model}_tuning_{config.label}.csv", index=False)
+        # The selected learner gains nothing; the logistic regression gains everything.
+        decided = {"base": same, "enriched": y if model == "logistic" else same}
+        pd.concat([pd.DataFrame({"row": np.arange(300), "fecha": _days(300), "model": model, "fold": fold,
+                                 "config": cfg, "split": "eval", "severidad": y, "decided": decided[cfg],
+                                 "c0": proba[:, 0], "c1": proba[:, 1], "c2": proba[:, 2]})
+                   for cfg in ("base", "enriched")]).to_parquet(
+            tmp_path / f"{model}_predictions_{config.label}.parquet", index=False)
+    out = train_main(config, report_dir=tmp_path, prediction_dir=tmp_path, summarize_only=True)["contrast"]
+    assert out["selection"]["model"].tolist() == ["lightgbm"]
+    primary = out["primary"]
+    assert primary["folds"].tolist() == ["holdout"] and primary["n_folds"].tolist() == [1]
+    assert primary.loc[0, "delta_f1_macro"] == 0 and primary.loc[0, "reading"] == "compatible with the folds"
+    assert {"delta_f1_macro_ci90_low", "delta_f1_macro_ci95_high", "delta_log_loss", "delta_pr_auc_2",
+            "delta_log_loss_p_holm", "delta_pr_auc_2_p_holm"} <= set(primary.columns)
+    secondary = out["secondary"].set_index("model")
+    assert secondary.loc["logistic", "reading"] == "95% interval excludes zero"
+    assert "folds_positive" not in primary and "folds_positive" not in secondary
+    assert (tmp_path / "contrast_primary_anomalies_holdout_c12_b50_s20261024.csv").exists()
+    assert not list(tmp_path.glob("contrast_*_anomalies_c12*"))
+
+
+def test_test_run_writes_only_files_of_its_own_label(synthetic_study, tmp_path):
+    """End to end on synthetic data: the run of the test fold evaluates 2026,
+    validates on 2025 and cannot overwrite the results of the folds."""
+    df, hourly = synthetic_study
+    df.to_parquet(tmp_path / "integrated_traffic_weather_quito.parquet")
+    hourly.to_parquet(tmp_path / "remmaq_meteorology_hourly.parquet")
+    reports, predictions = tmp_path / "reports", tmp_path / "predictions"
+    config = ExperimentConfig(models=["logistic"], n_candidates=1, bootstrap_replicates=20, holdout=True)
+    out = train_main(config, report_dir=reports, prediction_dir=predictions, processed_dir=tmp_path)["logistic"]
+    written = [path.name for path in [*reports.iterdir(), *predictions.iterdir()]]
+    assert len(written) == 6 and all("_anomalies_holdout_c1_b20_" in name for name in written)
+    assert out["metrics"]["fold"].unique().tolist() == ["2017-2025->2026"]
+    assert out["pooled"]["n_folds"].tolist() == [1]
+    years = pd.to_datetime(out["predictions"]["fecha"]).dt.year
+    assert set(years[out["predictions"]["split"] == "eval"]) == {2026}
+    assert set(years[out["predictions"]["split"] == "val"]) == {2025}
+
+
+def test_reading_of_the_test_run_only_asks_whether_the_interval_contains_zero():
+    assert holdout_reading(-0.02, 0.03) == "compatible with the folds"
+    assert holdout_reading(0.0, 0.03) == "compatible with the folds"
+    assert holdout_reading(0.001, 0.03) == "95% interval excludes zero"
+    assert holdout_reading(-0.03, -0.001) == "95% interval excludes zero"
 
 
 def test_shared_and_independent_hyperparameter_selection():
