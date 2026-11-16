@@ -853,7 +853,10 @@ def run_folds(
         probabilities and decided classes of the selected candidates, with the
         date of each crash as its resampling block). 'trivial' holds the
         references without features of every fold, which do not depend on the
-        learner.
+        learner. 'candidates' holds the raw validation and evaluation
+        probabilities of every candidate and configuration, with the prior
+        under which the model estimated them, so that the selection of the
+        candidate and its decision rule can be repeated on resampled days.
     """
     folds = folds or experiment_folds(config)
     if not any(fold.last_train_year > fold.first_train_year for fold in folds):
@@ -866,6 +869,7 @@ def run_folds(
         df = previous_hour_weather(df, hourly)
     tuning_rows, metric_rows, delta_rows, prediction_frames, pooled_input = [], [], [], [], []
     trivial_rows: List[Dict[str, Any]] = []
+    candidate_frames: List[pd.DataFrame] = []
     for fold in folds:
         t0 = time.time()
         frames = fold_frames(df, hourly, fold, config.dispatch_scenario, config.direct_assignment_only)
@@ -899,6 +903,11 @@ def run_folds(
                 row[f"val_f1_argmax_{cfg}"] = macro_f1_from_labels(y["val"], p_val.argmax(axis=1))
                 row[f"val_log_loss_{cfg}"] = multiclass_log_loss(y["val"], rule.stages(p_val)["calibrated"])
                 fitted[(i, cfg)] = {"rule": rule, "p_val": p_val, "p_eval": p_eval}
+                for split, p in (("val", p_val), ("eval", p_eval)):
+                    candidate_frames.append(pd.DataFrame({
+                        "row": frames[split].index.to_numpy(), "model": model, "fold": fold.name, "config": cfg,
+                        "split": split, "candidate": i, "p0": p[:, 0], "p1": p[:, 1], "p2": p[:, 2],
+                        **{f"prior{k}": learner.effective_prior_[k] for k in CLASSES}}))
             row["val_f1_mean"] = (row["val_f1_base"] + row["val_f1_enriched"]) / 2
             tuning_rows.append(row)
 
@@ -948,7 +957,8 @@ def run_folds(
     return {"tuning": pd.DataFrame(tuning_rows), "metrics": pd.DataFrame(metric_rows),
             "deltas": pd.DataFrame(delta_rows), "pooled": pooled,
             "predictions": pd.concat(prediction_frames, ignore_index=True),
-            "trivial": pd.DataFrame(trivial_rows)}
+            "trivial": pd.DataFrame(trivial_rows),
+            "candidates": pd.concat(candidate_frames, ignore_index=True)}
 
 
 def confirmatory_contrast(
@@ -1117,7 +1127,9 @@ def main(
 
     Metrics, intervals, tuning scores, contrasts and run metadata go to
     ``report_dir`` (default 'reports/modeling/'); validation and evaluation
-    probabilities go to ``prediction_dir`` (default 'data/modeling/'). Both are
+    probabilities go to ``prediction_dir`` (default 'data/modeling/'), those of
+    the selected candidates in one file per learner and those of every
+    candidate in another. Both are
     excluded from version control. Learners can be run in separate processes;
     the contrast is computed by whichever run finds the four sets of results.
 
@@ -1152,6 +1164,8 @@ def main(
                 out[name].to_csv(report_dir / f"{model}_{name}_{config.label}.csv", index=False)
             out["predictions"].to_parquet(prediction_dir / f"{model}_predictions_{config.label}.parquet",
                                           index=False)
+            out["candidates"].to_parquet(prediction_dir / f"{model}_candidates_{config.label}.parquet",
+                                         index=False)
             # The same table for every learner: it only depends on the folds and the seed.
             out["trivial"].to_csv(report_dir / f"trivial_references_{config.label}.csv", index=False)
             pooled = out["pooled"].iloc[0]

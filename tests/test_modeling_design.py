@@ -665,12 +665,52 @@ def test_test_run_writes_only_files_of_its_own_label(synthetic_study, tmp_path):
     config = ExperimentConfig(models=["logistic"], n_candidates=1, bootstrap_replicates=20, holdout=True)
     out = train_main(config, report_dir=reports, prediction_dir=predictions, processed_dir=tmp_path)["logistic"]
     written = [path.name for path in [*reports.iterdir(), *predictions.iterdir()]]
-    assert len(written) == 7 and all("_anomalies_holdout_c1_b20_" in name for name in written)
+    assert len(written) == 8 and all("_anomalies_holdout_c1_b20_" in name for name in written)
     assert out["metrics"]["fold"].unique().tolist() == ["2017-2025->2026"]
     assert out["pooled"]["n_folds"].tolist() == [1]
     years = pd.to_datetime(out["predictions"]["fecha"]).dt.year
     assert set(years[out["predictions"]["split"] == "eval"]) == {2026}
     assert set(years[out["predictions"]["split"] == "val"]) == {2025}
+
+
+def test_candidate_file_holds_every_candidate_and_reproduces_the_selection(synthetic_study, tmp_path):
+    """End to end on synthetic data: the file of every candidate contains the
+    selected one row by row, and is enough to repeat the validation scores."""
+    from src.decision import DecisionRule, macro_f1_from_labels
+    df, hourly = synthetic_study
+    df.to_parquet(tmp_path / "integrated_traffic_weather_quito.parquet")
+    hourly.to_parquet(tmp_path / "remmaq_meteorology_hourly.parquet")
+    reports, predictions = tmp_path / "reports", tmp_path / "predictions"
+    config = ExperimentConfig(models=["logistic"], n_candidates=3, bootstrap_replicates=20, first_train_year=2022)
+    out = train_main(config, report_dir=reports, prediction_dir=predictions, processed_dir=tmp_path)["logistic"]
+    assert sorted(path.name for path in predictions.iterdir()) == [
+        f"logistic_candidates_{config.label}.parquet", f"logistic_predictions_{config.label}.parquet"]
+    candidates = pd.read_parquet(predictions / f"logistic_candidates_{config.label}.parquet")
+    selected = pd.read_parquet(predictions / f"logistic_predictions_{config.label}.parquet")
+    pd.testing.assert_frame_equal(candidates, out["candidates"], check_exact=True)
+    assert list(candidates.columns) == ["row", "model", "fold", "config", "split", "candidate", "p0", "p1", "p2",
+                                        "prior0", "prior1", "prior2"]
+    assert np.allclose(candidates[["prior0", "prior1", "prior2"]], 1 / 3)
+
+    keys, raw = ["fold", "config", "split", "row"], ["p0", "p1", "p2"]
+    metrics, tuning = out["metrics"], out["tuning"]
+    assert len(metrics) == 4 and sorted(tuning["candidate"].unique()) == [0, 1, 2]
+    for _, chosen in metrics.iterrows():
+        group = candidates[(candidates["fold"] == chosen["fold"]) & (candidates["config"] == chosen["config"])]
+        # Every candidate covers the same validation and evaluation rows.
+        sizes = group.groupby("candidate")["row"].count()
+        assert sizes.tolist() == [chosen["n_val"] + chosen["n_eval"]] * 3
+        # The selected candidate is, row by row, the one of the predictions file.
+        mine = group[group["candidate"] == chosen["candidate"]].set_index(keys)[raw].sort_index()
+        theirs = selected[(selected["fold"] == chosen["fold"]) & (selected["config"] == chosen["config"])]
+        pd.testing.assert_frame_equal(mine, theirs.set_index(keys)[raw].sort_index(), check_exact=True)
+        # The validation score of every candidate can be recomputed from the file.
+        truth = theirs[theirs["split"] == "val"].set_index("row")["severidad"]
+        for candidate, rows in group[group["split"] == "val"].groupby("candidate"):
+            p, y = rows[raw].to_numpy(), truth.loc[rows["row"]].to_numpy()
+            rule = DecisionRule.fit(p, y, effective_prior=rows[["prior0", "prior1", "prior2"]].iloc[0].to_numpy())
+            stored = tuning[(tuning["fold"] == chosen["fold"]) & (tuning["candidate"] == candidate)]
+            assert macro_f1_from_labels(y, rule.predict(p)) == stored[f"val_f1_{chosen['config']}"].iloc[0]
 
 
 def test_reading_of_the_test_run_only_asks_whether_the_interval_contains_zero():
