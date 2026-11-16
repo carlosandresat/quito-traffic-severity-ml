@@ -35,6 +35,7 @@ from src.train_models import (
     fold_frames,
     holdout_reading,
     pooled_bootstrap_contrast,
+    run_folds,
     run_metadata,
     selected_candidates,
     smote_nc_resample,
@@ -361,6 +362,22 @@ def test_contrast_reading_follows_the_pre_specified_rule():
     assert contrast_reading(-0.03, -0.012, -0.028, -0.014) == "worsening"
 
 
+def test_contrast_reading_at_the_edges_of_the_rule():
+    m = EQUIVALENCE_MARGIN
+    assert contrast_reading(-0.009, -0.0005, -0.008, -0.001) == "worsening smaller than the margin"
+    assert contrast_reading(-0.016, -0.001, -0.014, -0.002) == "worsening"
+    # The 90% interval may exclude zero while the 95% interval contains it.
+    assert contrast_reading(-0.0092, 0.0004, -0.0081, -0.0003) == "equivalent"
+    # The margin and zero are open bounds: an interval that touches them does not pass.
+    assert contrast_reading(-0.012, 0.004, -m, 0.003) == "inconclusive"
+    assert contrast_reading(-0.004, 0.012, -0.003, m) == "inconclusive"
+    assert contrast_reading(0.0, 0.008, 0.001, 0.007) == "equivalent"
+    assert contrast_reading(-0.008, 0.0, -0.007, -0.001) == "equivalent"
+    assert contrast_reading(0.0, 0.03, 0.002, 0.028) == "inconclusive"
+    # An interval that could not be computed is never read as a result.
+    assert contrast_reading(*[float("nan")] * 4) == "inconclusive"
+
+
 def test_pooled_bootstrap_averages_fold_differences():
     rng = np.random.default_rng(4)
     folds = []
@@ -398,9 +415,39 @@ def test_every_learner_returns_probabilities_and_tolerates_unseen_categories():
         assert np.allclose(proba.sum(axis=1), 1.0)
 
 
-def test_both_configurations_draw_the_same_candidates():
+def test_both_configurations_draw_the_same_candidates(synthetic_study, monkeypatch):
+    """Every candidate is fitted once per configuration with the same
+    hyperparameters and seed, and both configurations keep the same one."""
+    import src.train_models as tm
     for name in MODELS:
         assert candidate_params(name) == candidate_params(name)
+        grid_size = int(np.prod([len(values) for values in tm.SEARCH_SPACES[name].values()]))
+        assert len(candidate_params(name)) == min(tm.N_CANDIDATES, grid_size)
+        assert candidate_params(name, n_candidates=3, seed=1) != candidate_params(name, n_candidates=3, seed=2)
+
+    fitted = []
+    original = tm.SeverityModel.__init__
+
+    def recording_init(self, name, params, numeric, categorical, seed=tm.RANDOM_STATE):
+        fitted.append((dict(params), list(numeric), list(categorical), seed))
+        original(self, name, params, numeric, categorical, seed)
+
+    monkeypatch.setattr(tm.SeverityModel, "__init__", recording_init)
+    df, hourly = synthetic_study
+    config = ExperimentConfig(n_candidates=3, bootstrap_replicates=20)
+    out = run_folds(df, hourly, "logistic", config, folds=[expanding_folds()[-1]], verbose=False)
+    candidates = candidate_params("logistic", 3)
+    assert len(fitted) == 2 * len(candidates) == 6
+    for i, params in enumerate(candidates):
+        (base_params, base_numeric, base_categorical, base_seed), \
+            (enriched_params, enriched_numeric, enriched_categorical, enriched_seed) = fitted[2 * i:2 * i + 2]
+        assert base_params == enriched_params == params and base_seed == enriched_seed == config.seed
+        assert set(base_numeric) < set(enriched_numeric) and base_categorical == enriched_categorical
+    assert out["tuning"]["params"].tolist() == [repr(params) for params in candidates]
+    metrics = out["metrics"].set_index("config")
+    best = int(out["tuning"].loc[out["tuning"]["val_f1_mean"].idxmax(), "candidate"])
+    assert metrics.loc["base", "candidate"] == metrics.loc["enriched", "candidate"] == best
+    assert metrics.loc["base", "params"] == metrics.loc["enriched", "params"] == repr(candidates[best])
 
 
 def test_every_learner_is_exactly_reproducible():
@@ -412,6 +459,53 @@ def test_every_learner_is_exactly_reproducible():
         runs = [SeverityModel(name, params, ["x"], ["cell"]).fit(train, train["severidad"].to_numpy())
                 .predict_proba(other) for _ in range(2)]
         assert np.array_equal(runs[0], runs[1]), name
+
+
+def _alter_from(df: pd.DataFrame, hourly: pd.DataFrame, year: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Copies of the data with every crash and every hourly record from ``year`` on changed."""
+    df, hourly = df.copy(), hourly.copy()
+    late = pd.to_datetime(df["fecha"]).dt.year >= year
+    df.loc[late, "severidad"] = 2 - df.loc[late, "severidad"]
+    df.loc[late, "hora"] = (df.loc[late, "hora"] + 7) % 24
+    df.loc[late, "dia_semana"] = df.loc[late, "dia_semana"] % 7 + 1
+    df.loc[late, "lat"] += 0.07
+    df.loc[late, "distancia_geografica_mas_cercana_km"] += 3.0
+    swapped = df.loc[late, "estacion_climatica_utilizada"].map({"Belisario": "Tumbaco", "Tumbaco": "Belisario"})
+    df.loc[late, "estacion_climatica_utilizada"] = swapped
+    df.loc[late, "estacion_geografica_mas_cercana"] = swapped
+    late_hours = pd.to_datetime(hourly["fecha_hora"]).dt.year >= year
+    hourly.loc[late_hours, WEATHER_SOURCE] += 50.0
+    return df, hourly
+
+
+@pytest.mark.parametrize("model", ["logistic", "lightgbm"])
+def test_the_evaluated_year_does_not_reach_selection_rule_or_validation(synthetic_study, monkeypatch, model):
+    """End to end on synthetic data: changing the outcomes, the features and the
+    weather of the evaluated year changes its predictions and nothing else."""
+    import src.train_models as tm
+    monkeypatch.setitem(tm.SEARCH_SPACES, "lightgbm", {
+        "n_estimators": [15, 30], "learning_rate": [0.1], "num_leaves": [7, 15], "min_child_samples": [5, 20]})
+    df, hourly = synthetic_study
+    config = ExperimentConfig(n_candidates=3, bootstrap_replicates=20)
+    for fold in (expanding_folds()[0], expanding_folds()[-1]):
+        altered = _alter_from(df, hourly, fold.eval_year)
+        first, second = (run_folds(crashes, grid, model, config, folds=[fold], verbose=False)
+                         for crashes, grid in ((df, hourly), altered))
+        # Selection: the validation scores of every candidate, hence the chosen one.
+        pd.testing.assert_frame_equal(first["tuning"], second["tuning"], check_exact=True)
+        # Decision rule and sizes of the frames fitted before the evaluated year.
+        fitted = ["config", "candidate", "params", "val_f1", "temperature", "weight_injury", "weight_fatal",
+                  "n_fit", "n_val", "n_eval"]
+        pd.testing.assert_frame_equal(first["metrics"][fitted], second["metrics"][fitted], check_exact=True)
+        # Validation predictions: raw and calibrated probabilities and decided classes.
+        validation = [run["predictions"].query("split == 'val'").reset_index(drop=True) for run in (first, second)]
+        pd.testing.assert_frame_equal(validation[0], validation[1], check_exact=True)
+        # The change did reach the evaluated year.
+        evaluated = [run["predictions"].query("split == 'eval'").reset_index(drop=True) for run in (first, second)]
+        assert evaluated[0]["row"].equals(evaluated[1]["row"])
+        assert (evaluated[0]["severidad"] == 2 - evaluated[1]["severidad"]).all()
+        assert not np.allclose(evaluated[0][["p0", "p1", "p2"]], evaluated[1][["p0", "p1", "p2"]])
+        assert first["metrics"]["f1_macro"].tolist() != second["metrics"]["f1_macro"].tolist()
 
 
 def test_contrast_selects_the_learner_on_validation_only(tmp_path):
