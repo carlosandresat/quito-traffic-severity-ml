@@ -25,6 +25,14 @@ only as the reference category, so that each exposure yields two odds ratios
 - The window restricts the crashes, not the meteorological series: the
   anomalies of the continuous exposures are departures from the station
   climatology of the hourly series from 2017 to 2024.
+- The main table uses the weather of the crash-hour mark and includes the 14
+  national police records of December 2024, as it was first run. Each
+  sensitivity changes one decision, keeps the seven exposures and applies its
+  own Holm correction: the weather of the previous hourly mark, which is the
+  one the predictive models use; rain defined as any precipitation in the
+  hour, which adds the hours with one step of the gauge (0.1 mm); the months
+  without valid source data left out; and the adjustment for the control
+  entity.
 """
 
 import sys
@@ -42,25 +50,48 @@ if str(repo_root) not in sys.path:
 
 from src.climatology import StationClimatology
 from src.eda_statistics import format_latex_table, holm_adjust
-from src.features import control_entity
+from src.features import CLIMATE_HOUR, CLIMATE_MONTH, control_entity, previous_hour_weather
+from src.folds import UNEVALUATED_MONTHS
 
 WINDOW: Tuple[int, int] = (2019, 2024)
 ADJUSTMENT: List[str] = ["hora", "dia_semana", "mes", "estacion_geografica_mas_cercana", "anio"]
 CONTRASTS: Dict[int, str] = {1: "injury vs property damage", 2: "fatal vs property damage"}
 ANTECEDENT_RAIN_MM: float = 0.5
 
+# Tables written by ``main``: file suffix, options of ``associative_table`` and
+# the text added to the caption. The first one is the main table.
+TABLES: Dict[str, Tuple[Dict[str, bool], str]] = {
+    "": ({}, ""),
+    "_entity_adjusted": ({"adjust_entity": True}, ", sensitivity adjusted for the control entity"),
+    "_previous_mark": ({"previous_mark": True},
+                       ", sensitivity with the weather of the hourly mark before the crash hour"),
+    "_any_rain": ({"any_rain": True},
+                  ", sensitivity with rain defined as any precipitation in the hour (more than 0 mm)"),
+    "_without_december_2024": ({"drop_months_without_data": True},
+                               ", sensitivity without the months that lack valid source data (December 2024)"),
+}
 
-def exposures(df: pd.DataFrame, climatology: StationClimatology) -> pd.DataFrame:
+
+def exposures(df: pd.DataFrame, climatology: StationClimatology, any_rain: bool = False) -> pd.DataFrame:
     """Weather exposures of the associative analysis, one column per model.
 
-    Binary exposures: rain in the hour ('lluvia_flag') and antecedent rain
-    (3-hour accumulation above 0.5 mm). Continuous exposures: the anomalies of
-    temperature, humidity, wind speed, solar radiation and pressure, in standard
-    deviations of the analysed crashes. Missing values stay missing.
+    Binary exposures: rain in the hour ('lluvia_flag', more than 0.1 mm) and
+    antecedent rain (3-hour accumulation above 0.5 mm). Continuous exposures:
+    the anomalies of temperature, humidity, wind speed, solar radiation and
+    pressure, in standard deviations of the analysed crashes. Missing values
+    stay missing. The climatology is read at the month and hour of the weather
+    mark when ``df`` comes from ``previous_hour_weather``, and at those of the
+    crash otherwise. With ``any_rain``, rain in the hour becomes
+    'lluvia_mayor_que_cero' (more than 0 mm).
     """
-    anomalies = climatology.anomalies(df)
+    month_col = CLIMATE_MONTH if CLIMATE_MONTH in df else "mes"
+    hour_col = CLIMATE_HOUR if CLIMATE_HOUR in df else "hora"
+    anomalies = climatology.anomalies(df, month_col=month_col, hour_col=hour_col)
     out = pd.DataFrame(index=df.index)
-    out["lluvia_flag"] = df["lluvia_flag"].astype(float)
+    if any_rain:
+        out["lluvia_mayor_que_cero"] = (df["lluvia_1h"] > 0).astype(float).where(df["lluvia_1h"].notna())
+    else:
+        out["lluvia_flag"] = df["lluvia_flag"].astype(float)
     out["lluvia_antecedente"] = (df["lluvia_acum_3h"] > ANTECEDENT_RAIN_MM).astype(float).where(
         df["lluvia_acum_3h"].notna())
     for var in ["tmp", "hum", "vel", "rs", "pre"]:
@@ -177,7 +208,8 @@ def exposure_odds_ratios(df: pd.DataFrame, exposure: pd.Series, adjustment: List
 
 
 def associative_table(df: pd.DataFrame, hourly: pd.DataFrame, adjust_entity: bool = False,
-                      window: Tuple[int, int] = WINDOW) -> pd.DataFrame:
+                      window: Tuple[int, int] = WINDOW, previous_mark: bool = False, any_rain: bool = False,
+                      drop_months_without_data: bool = False) -> pd.DataFrame:
     """Crude and adjusted odds ratios of every exposure, with Holm on the adjusted ones.
 
     Parameters
@@ -190,6 +222,17 @@ def associative_table(df: pd.DataFrame, hourly: pd.DataFrame, adjust_entity: boo
         Inclusive years of the crashes analysed. The climatology of the
         anomalies is fitted on the hourly series from its first year (2017) to
         ``window[1]``, not from ``window[0]``.
+    previous_mark : bool
+        Take the exposures from the hourly mark before the crash hour, at the
+        station that supplied the crash weather (sensitivity analysis). The
+        adjustment set keeps the hour and the month of the crash.
+    any_rain : bool
+        Define rain in the hour as more than 0 mm instead of more than 0.1 mm
+        (sensitivity analysis).
+    drop_months_without_data : bool
+        Leave out the crashes of the months without valid source data
+        (sensitivity analysis); in the default window, the national police
+        records of December 2024.
 
     Returns
     -------
@@ -199,15 +242,21 @@ def associative_table(df: pd.DataFrame, hourly: pd.DataFrame, adjust_entity: boo
         ratio of clustered to model-based standard errors, and the Holm-adjusted
         clustered p-value of the adjusted odds ratios.
     """
-    years = pd.to_datetime(df["fecha"]).dt.year
-    sub = df[(years >= window[0]) & (years <= window[1])].copy()
+    dates = pd.to_datetime(df["fecha"])
+    years = dates.dt.year
+    analysed = (years >= window[0]) & (years <= window[1])
+    if drop_months_without_data:
+        analysed &= ~dates.dt.to_period("M").astype(str).isin(UNEVALUATED_MONTHS)
+    sub = df[analysed].copy()
+    if previous_mark:
+        sub = previous_hour_weather(sub, hourly)
     sub["anio"] = years[sub.index]
     sub["ente_control"] = control_entity(sub["id_siniestro"])
     adjustment = ADJUSTMENT + (["ente_control"] if adjust_entity else [])
     climatology = StationClimatology.fit(hourly, last_year=window[1])
     clusters = pd.to_datetime(sub["fecha"]).dt.normalize().to_numpy()
     rows = []
-    for name, exposure in exposures(sub, climatology).items():
+    for name, exposure in exposures(sub, climatology, any_rain=any_rain).items():
         crude = exposure_odds_ratios(sub, exposure, [], clusters)
         adjusted = exposure_odds_ratios(sub, exposure, adjustment, clusters)
         for c, a in zip(crude, adjusted):
@@ -227,14 +276,12 @@ def main() -> None:
     df = pd.read_parquet(processed / "integrated_traffic_weather_quito.parquet")
     hourly = pd.read_parquet(processed / "remmaq_meteorology_hourly.parquet")
     out_dir = repo_root / "reports" / "tables"
-    for adjust_entity, suffix in ((False, ""), (True, "_entity_adjusted")):
-        table = associative_table(df, hourly, adjust_entity=adjust_entity)
+    for suffix, (options, caption_suffix) in TABLES.items():
+        table = associative_table(df, hourly, **options)
         stem = f"table5_associative_odds_ratios{suffix}"
         table.to_csv(out_dir / f"{stem}.csv", index=False)
         caption = ("Adjusted odds ratios of weather exposures (multinomial logit, reference: property damage only; "
-                   "standard errors clustered by date; Holm over all odds ratios)")
-        if adjust_entity:
-            caption += ", sensitivity adjusted for the control entity"
+                   "standard errors clustered by date; Holm over all odds ratios)") + caption_suffix
         (out_dir / f"{stem}.tex").write_text(
             format_latex_table(table[["exposure", "contrast", "or_adjusted", "ci95_low", "ci95_high",
                                       "p_value", "p_holm"]], caption, f"tab:{stem}"), encoding="utf-8")
