@@ -217,8 +217,9 @@ def compute_meteorological_lags(df: pd.DataFrame) -> pd.DataFrame:
 
     Features computed:
         - lluvia_1h: Instantaneous precipitation (mm/h); NaN when 'llu' is missing.
-        - lluvia_flag: Nullable indicator of active precipitation (>0.1 mm/h);
-          missing when 'lluvia_1h' is missing.
+        - lluvia_flag: Nullable indicator of active precipitation: more than
+          0.1 mm in the hour, that is, 0.2 mm or more, because the series is
+          recorded in steps of 0.1 mm. Missing when 'lluvia_1h' is missing.
         - lluvia_acum_3h: 3-hour cumulative precipitation (road wetness proxy).
         - lluvia_acum_6h: 6-hour cumulative precipitation.
         - temp_delta_3h: Temperature change over the preceding 3 hours (°C).
@@ -250,7 +251,10 @@ def compute_meteorological_lags(df: pd.DataFrame) -> pd.DataFrame:
 
     by_station = df.groupby("estacion", sort=False)
     df["lluvia_1h"] = df["llu"].astype(np.float32)
-    df["lluvia_flag"] = (df["lluvia_1h"] > 0.1).astype("Int8").mask(df["lluvia_1h"].isna())
+    # More than one step of the gauge (0.1 mm). The threshold sits between two
+    # readings, so the flag does not depend on the floating-point type of the
+    # column: 0.1 stored as float32 is larger than 0.1 as float64.
+    df["lluvia_flag"] = (df["lluvia_1h"] > 0.15).astype("Int8").mask(df["lluvia_1h"].isna())
     df["lluvia_acum_3h"] = (
         by_station["llu"].rolling(window=3, min_periods=1).sum()
         .reset_index(level=0, drop=True).astype(np.float32)

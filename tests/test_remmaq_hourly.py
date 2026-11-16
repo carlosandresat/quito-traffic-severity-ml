@@ -85,6 +85,16 @@ def test_lags_respect_missing_hours():
     np.testing.assert_allclose(lagged["temp_delta_3h"], [np.nan, np.nan, np.nan, 3.0, 3.0, np.nan])
 
 
+def test_rain_flag_needs_more_than_one_step_of_the_gauge():
+    hours = pd.date_range("2025-01-01", periods=5, freq="h")
+    observed = pd.DataFrame({"estacion": "A", "fecha_hora": hours, "tmp": 10.0,
+                             "llu": [0.0, 0.1, 0.2, np.nan, 1.5]})
+    lagged = compute_meteorological_lags(reindex_to_hourly_grid(observed))
+    assert lagged["lluvia_flag"].astype("float").tolist()[:3] == [0.0, 0.0, 1.0]
+    assert lagged["lluvia_flag"].isna().tolist() == [False, False, False, True, False]
+    assert lagged["lluvia_flag"].iloc[4] == 1
+
+
 # --- Processed matrix -----------------------------------------------------------------
 
 def test_station_hour_keys_are_unique(remmaq_df):
@@ -116,7 +126,21 @@ def test_precipitation_is_not_zero_filled(remmaq_df):
     flag = remmaq_df["lluvia_flag"]
     assert (flag.isna() == rain.isna()).all()
     observed = rain.notna()
-    assert ((rain[observed] > 0.1).astype(int) == flag[observed].astype(int)).all()
+    assert ((rain[observed] > 0.15).astype(int) == flag[observed].astype(int)).all()
+
+
+def test_rain_flag_threshold_reproduces_the_stored_flag_in_any_float_type(remmaq_df, integrated_df):
+    """The flag of the processed datasets is 'lluvia_1h' > 0.15 row by row,
+    whether the column is read as float32 or as float64: no reading lies between
+    0.1 and 0.2 mm, so the threshold separates one step of the gauge from two."""
+    for data in (remmaq_df, integrated_df):
+        rain, flag = data["lluvia_1h"], data["lluvia_flag"]
+        observed = rain.notna()
+        assert (flag.isna() == rain.isna()).all()
+        assert not ((rain > 0.11) & (rain < 0.19)).any()
+        for dtype in ("float32", "float64"):
+            recomputed = (rain[observed].astype(dtype) > 0.15).astype(int)
+            assert (recomputed == flag[observed].astype(int)).all(), dtype
 
 
 def test_every_year_has_joint_temperature_and_precipitation(remmaq_df):
