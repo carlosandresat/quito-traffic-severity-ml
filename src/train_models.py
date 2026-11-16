@@ -645,7 +645,10 @@ def fold_frames(df: pd.DataFrame, hourly: pd.DataFrame, fold: TemporalFold, disp
 
     The model is fitted on the training years except the last one, which is the
     validation period. The climatology and the cell exposure are fitted on the
-    fit years only. Months without valid source data (``UNEVALUATED_MONTHS``)
+    fit years only. In every training window the climatology uses the hourly
+    series from its first year, 2017, to the last fit year: the first training
+    year restricts the crashes, whose recording changed in 2019, not the
+    meteorological series. Months without valid source data (``UNEVALUATED_MONTHS``)
     enter no frame; among the fit years of the folds only the test fold has such
     rows, the 14 national police records of December 2024.
     With ``direct_only``, the three frames keep the crashes with

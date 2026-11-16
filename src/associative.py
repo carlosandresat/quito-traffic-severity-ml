@@ -22,6 +22,9 @@ only as the reference category, so that each exposure yields two odds ratios
   crash having occurred and been recorded, and the recording of non-fatal
   crashes changed in 2019 (auditorias/D_deriva_registro.md): mixing both
   regimes would mix two selection mechanisms in the same estimate.
+- The window restricts the crashes, not the meteorological series: the
+  anomalies of the continuous exposures are departures from the station
+  climatology of the hourly series from 2017 to 2024.
 """
 
 import sys
@@ -184,7 +187,9 @@ def associative_table(df: pd.DataFrame, hourly: pd.DataFrame, adjust_entity: boo
     adjust_entity : bool
         Add the control entity to the adjustment set (sensitivity analysis).
     window : Tuple[int, int]
-        Inclusive years analysed.
+        Inclusive years of the crashes analysed. The climatology of the
+        anomalies is fitted on the hourly series from its first year (2017) to
+        ``window[1]``, not from ``window[0]``.
 
     Returns
     -------
