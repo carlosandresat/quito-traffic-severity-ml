@@ -405,6 +405,19 @@ def test_sensitivity_labels_keep_their_results_apart():
     assert ExperimentConfig(smote_nc=True).label == "anomalies_smotenc"
 
 
+def test_label_encodes_a_budget_or_seed_other_than_the_study_defaults():
+    from src.train_models import BOOTSTRAP_REPLICATES, N_CANDIDATES, RANDOM_STATE
+    explicit = ExperimentConfig(n_candidates=N_CANDIDATES, bootstrap_replicates=BOOTSTRAP_REPLICATES,
+                                seed=RANDOM_STATE)
+    assert explicit.label == ExperimentConfig().label == "anomalies"
+    assert ExperimentConfig(seed=1).label == f"anomalies_c{N_CANDIDATES}_b{BOOTSTRAP_REPLICATES}_s1"
+    assert ExperimentConfig(seed=1).label != ExperimentConfig(seed=2).label
+    assert ExperimentConfig(n_candidates=2).label == f"anomalies_c2_b{BOOTSTRAP_REPLICATES}_s{RANDOM_STATE}"
+    assert ExperimentConfig(bootstrap_replicates=50).label != ExperimentConfig().label
+    assert ExperimentConfig(first_train_year=2019, smote_nc=True, seed=7).label == \
+        f"anomalies_from2019_smotenc_c{N_CANDIDATES}_b{BOOTSTRAP_REPLICATES}_s7"
+
+
 def test_direct_only_restricts_every_frame_but_not_the_exposure(integrated_df):
     hourly_path = Path(__file__).resolve().parents[1] / "data" / "processed" / "remmaq_meteorology_hourly.parquet"
     if not hourly_path.exists():

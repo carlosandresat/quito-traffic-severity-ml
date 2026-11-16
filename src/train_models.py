@@ -211,6 +211,11 @@ class ExperimentConfig:
             label += "_directonly"
         if self.smote_nc:
             label += "_smotenc"
+        # A run with another budget or seed writes to its own files, so it cannot
+        # overwrite the results of the study defaults nor be mixed with them.
+        if (self.n_candidates, self.bootstrap_replicates, self.seed) != (
+                N_CANDIDATES, BOOTSTRAP_REPLICATES, RANDOM_STATE):
+            label += f"_c{self.n_candidates}_b{self.bootstrap_replicates}_s{self.seed}"
         return label
 
 
