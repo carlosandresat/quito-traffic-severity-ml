@@ -1097,7 +1097,9 @@ def _metadata(command: str, labels: Sequence[str], files: Sequence[Path], **sett
             return None
 
     return {"script": "src/posthoc.py", "command": command, "labels": list(labels), **settings,
-            "git_commit": git("rev-parse", "HEAD"), "git_tag": git("describe", "--tags", "--exact-match"),
+            "git_commit": git("rev-parse", "HEAD"),
+            # Every tag of the commit: the training and analysis tags may share one.
+            "git_tags": (git("tag", "--points-at", "HEAD") or "").split(),
             "git_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
             "inputs": {path.name: _sha256(path) for path in files}}
 

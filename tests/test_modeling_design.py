@@ -1023,7 +1023,8 @@ def test_run_metadata_records_full_provenance(monkeypatch, tmp_path):
     path = tmp_path / "logistic_predictions_anomalies.parquet"
     predictions.to_parquet(path, index=False)
     meta = run_metadata(ExperimentConfig(feature_set="timeonly", placebo_weather=None), [], 0.0, 1.0, outputs=[path])
-    assert {"git_commit", "git_tag", "git_dirty", "cpu_model", "cpu_count", "effective_cpu_count"} <= set(meta)
+    assert {"git_commit", "git_tags", "git_dirty", "cpu_model", "cpu_count", "effective_cpu_count"} <= set(meta)
+    assert isinstance(meta["git_tags"], list)
     assert meta["config"]["feature_set"] == "timeonly" and meta["config"]["holdout"] is False
     assert meta["thread_environment"]["OMP_NUM_THREADS"] == "3" and meta["thread_environment"]["MKL_NUM_THREADS"] is None
     assert set(meta["thread_environment"]) == set(tm.THREAD_VARIABLES)
@@ -1036,6 +1037,34 @@ def test_run_metadata_records_full_provenance(monkeypatch, tmp_path):
     assert json.loads(json.dumps(meta, default=str))["outputs"] == meta["outputs"]
     monkeypatch.delenv(tm.CANARY_VARIABLE)
     assert run_metadata(ExperimentConfig(), [], 0.0, 1.0)["session_canary_sha256"] is None
+
+
+def test_metadata_record_every_tag_of_the_commit(monkeypatch):
+    """The training and analysis tags may point at the same commit; ``git describe``
+    would give only one of them, so the metadata keep the list of all."""
+    import subprocess
+    from src import posthoc
+    real_run = subprocess.run
+
+    def fake_run(args, *rest, **kwargs):
+        if list(args[1:3]) == ["tag", "--points-at"]:
+            return subprocess.CompletedProcess(args, 0, stdout="study-training\nstudy-analysis\n", stderr="")
+        return real_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    tags = ["study-training", "study-analysis"]
+    assert run_metadata(ExperimentConfig(), [], 0.0, 1.0)["git_tags"] == tags
+    assert posthoc._metadata("table", ["anomalies"], [])["git_tags"] == tags
+    # A commit without tags, or no git at all, gives an empty list.
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="", stderr=""))
+    assert run_metadata(ExperimentConfig(), [], 0.0, 1.0)["git_tags"] == []
+
+    def missing(*args, **kwargs):
+        raise OSError("git not found")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    assert run_metadata(ExperimentConfig(), [], 0.0, 1.0)["git_tags"] == []
+    assert posthoc._metadata("table", ["anomalies"], [])["git_tags"] == []
 
 
 def test_run_of_the_four_learners_ends_with_the_printed_contrast_and_a_canary(synthetic_study, monkeypatch,
