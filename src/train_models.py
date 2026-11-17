@@ -59,7 +59,8 @@ class and a draw with the class shares of the fit rows).
 The test of January-July 2026 is a run of its own (``holdout``): one fold fitted
 up to 2024 and validated on 2025, written under its own label so that it cannot
 overwrite the results of the folds, and contrasted as a single period. No other
-run evaluates 2026.
+run evaluates 2026, and the test is refused for a learner that already has the
+results of a test run, whatever their budget, seed or options.
 """
 
 import argparse
@@ -1194,6 +1195,16 @@ def run_metadata(config: ExperimentConfig, inputs: List[Path], started: float, f
     }
 
 
+def existing_test_results(models: List[str], report_dir: Path, prediction_dir: Path) -> List[Path]:
+    """Files already written by a test run (``holdout``) of the given learners.
+
+    Any label of a test run counts, so that a second run with another seed,
+    budget or option is found too.
+    """
+    return sorted(path for model in models for folder in (report_dir, prediction_dir)
+                  for path in folder.glob(f"{model}_*_holdout*"))
+
+
 def main(
     config: Optional[ExperimentConfig] = None,
     report_dir: Optional[Path] = None,
@@ -1210,6 +1221,10 @@ def main(
     candidate in another. Both are
     excluded from version control. Learners can be run in separate processes;
     the contrast is computed by whichever run finds the four sets of results.
+
+    The test of 2026 is evaluated once: a ``holdout`` run stops before reading
+    the data if a test run of any of its learners left results in those
+    directories. Its contrast can still be recomputed with ``summarize_only``.
 
     Returns
     -------
@@ -1232,6 +1247,12 @@ def main(
             raise RuntimeError(
                 f"XGBoost needs {XGBOOST_N_THREADS} cores to reproduce the study; "
                 f"this machine offers {effective_cpu_count()}.")
+        if config.holdout:
+            previous = existing_test_results(config.models, report_dir, prediction_dir)
+            if previous:
+                raise FileExistsError(
+                    f"The 2026 test is evaluated once and {len(previous)} files of a test run already exist "
+                    f"(first: {previous[0].name}). Use --summarize-only to recompute its contrast.")
         df = pd.read_parquet(inputs[0])
         hourly = pd.read_parquet(inputs[1])
         for model in config.models:

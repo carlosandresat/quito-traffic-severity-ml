@@ -812,6 +812,43 @@ def test_placebo_run_changes_the_weather_and_leaves_the_baseline_untouched(synth
     assert not np.allclose(enriched[0][["p0", "p1", "p2"]], enriched[1][["p0", "p1", "p2"]])
 
 
+def test_second_test_run_is_refused_before_reading_the_data(synthetic_study, tmp_path):
+    """End to end on synthetic data: once a learner has the results of a test
+    run, no other test run of that learner starts, whatever its seed or options."""
+    df, hourly = synthetic_study
+    df.to_parquet(tmp_path / "integrated_traffic_weather_quito.parquet")
+    hourly.to_parquet(tmp_path / "remmaq_meteorology_hourly.parquet")
+    reports, predictions, missing = tmp_path / "reports", tmp_path / "predictions", tmp_path / "no_data"
+    budget = dict(models=["logistic"], n_candidates=1, bootstrap_replicates=20)
+
+    def run(processed_dir=missing, **options):
+        return train_main(ExperimentConfig(**budget, **options), report_dir=reports, prediction_dir=predictions,
+                          processed_dir=processed_dir)
+
+    # Results of the folds do not block the test, which then runs once.
+    run(processed_dir=tmp_path, first_train_year=2022)
+    run(processed_dir=tmp_path, holdout=True)
+    written = {path: path.read_bytes() for folder in (reports, predictions) for path in folder.iterdir()}
+    assert sum("_holdout" in path.name for path in written) == 8
+
+    # The directory without data shows that the refusal comes before reading anything.
+    for options in ({}, {"seed": 5}, {"first_train_year": 2019}, {"direct_assignment_only": True},
+                    {"class_weights": False}):
+        with pytest.raises(FileExistsError, match="The 2026 test is evaluated once"):
+            run(holdout=True, **options)
+    assert {path: path.read_bytes() for folder in (reports, predictions) for path in folder.iterdir()} == written
+
+    # Another learner has not been tested yet, and the folds can always be run again.
+    with pytest.raises(FileNotFoundError):
+        train_main(ExperimentConfig(models=["lightgbm"], holdout=True), report_dir=reports,
+                   prediction_dir=predictions, processed_dir=missing)
+    with pytest.raises(FileNotFoundError):
+        run(first_train_year=2022)
+    # Recomputing the contrast from the saved results fits nothing and is allowed.
+    assert train_main(ExperimentConfig(holdout=True, **budget), report_dir=reports, prediction_dir=predictions,
+                      summarize_only=True) == {}
+
+
 def test_reading_of_the_test_run_only_asks_whether_the_interval_contains_zero():
     assert holdout_reading(-0.02, 0.03) == "compatible with the folds"
     assert holdout_reading(0.0, 0.03) == "compatible with the folds"
