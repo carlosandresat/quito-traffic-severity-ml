@@ -315,3 +315,55 @@ def test_runs_of_refit_with_another_budget_or_with_candidates_write_files_of_the
             ph.main(["mixture", "--replicates", "4", *common[:4]])
     finally:
         contrast.unlink()
+
+
+# --- Pre-specified readings of the 2026 test and of the minimal baselines -----------------
+
+def test_readings_apply_the_fixed_rules_to_the_interval_with_the_rule_and_the_learner_refitted(tmp_path):
+    import json
+    from dataclasses import asdict
+
+    main = ExperimentConfig()
+    (tmp_path / f"run_metadata_{main.label}_{'-'.join(main.models)}.json").write_text(
+        json.dumps({"config": asdict(main)}), encoding="utf-8")
+    labels = ph.related_labels(main.label, tmp_path)
+    assert labels == {"test": "anomalies_holdout", "timeonly": "anomalies_timeonly", "spaceonly": "anomalies_spaceonly"}
+
+    def write(label, difference, conditional, refitted, replicates=1000):
+        pd.DataFrame([{"delta_f1_macro": difference, "delta_f1_macro_ci95_low": conditional[0],
+                       "delta_f1_macro_ci95_high": conditional[1]}]).to_csv(
+            tmp_path / f"contrast_primary_{label}.csv", index=False)
+        rows = [{"contrast": name, "replicates": replicates, "ci95_low": low, "ci95_high": high}
+                for name, (low, high) in (("selected learner; rule refitted", (-1.0, -0.9)),
+                                          (ph.READING_CONTRAST, refitted))]
+        pd.DataFrame(rows).to_csv(tmp_path / f"posthoc_refit_summary_{label}_r{replicates}.csv", index=False)
+
+    with pytest.raises(FileNotFoundError):
+        ph.fixed_readings(main.label, tmp_path)
+    write(main.label, 0.0002, (-0.0067, 0.0074), (-0.0105, 0.0100))
+    assert ph.fixed_readings(main.label, tmp_path)[0].empty
+    # A single baseline is not enough for the reading of §C.2.
+    write(labels["timeonly"], 0.03, (0.015, 0.045), (0.01, 0.05))
+    assert ph.fixed_readings(main.label, tmp_path)[0].empty
+    write(labels["spaceonly"], 0.012, (0.004, 0.02), (-0.002, 0.03))
+    # The conditional interval of the test excludes the difference of the folds; the refitted one does not.
+    write(labels["test"], 0.01, (0.004, 0.03), (-0.02, 0.03))
+    # Another number of replicates is not read.
+    write(labels["test"], 0.5, (0.4, 0.6), (0.4, 0.6), replicates=400)
+    readings, files = ph.fixed_readings(main.label, tmp_path)
+    readings = readings.set_index("reading")
+    assert readings.loc["C.1 2026 test", "result"] == "compatible with the folds"
+    assert readings.loc["C.1 2026 test", "folds_difference"] == 0.0002
+    assert readings.loc["C.1 2026 test", ["ci95_low", "ci95_high"]].tolist() == [-0.02, 0.03]
+    assert readings.loc["C.2 full baseline minus timeonly", "result"] == "clearly above"
+    assert readings.loc["C.2 full baseline minus spaceonly", "result"] == "not distinguished"
+    smaller = readings.loc["C.2 smaller of the two differences (text)"]
+    assert smaller["label"] == "anomalies_spaceonly" and smaller["result"] == "not distinguished"
+    assert len(files) == 8 and not any("_r400" in path.name for path in files)
+
+    # By the command line, with the same table.
+    ph.main(["readings", "--label", main.label, "--report-dir", str(tmp_path)])
+    written = pd.read_csv(tmp_path / f"posthoc_readings_{main.label}.csv").set_index("reading")
+    assert written["result"].tolist() == readings["result"].tolist()
+    meta = json.loads((tmp_path / f"posthoc_metadata_readings_{main.label}.json").read_text(encoding="utf-8"))
+    assert meta["replicates"] == 1000 and len(meta["inputs"]) == 8

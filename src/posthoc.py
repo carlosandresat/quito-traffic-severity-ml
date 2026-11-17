@@ -25,6 +25,10 @@ dependence of the result on choices of the procedure.
     without victims.
 ``mixture``
     Combination of the runs that differ only in the training seed.
+``readings``
+    The pre-specified readings of the 2026 test (plan §C.1) and of the minimal
+    baselines (§C.2), from the contrasts of the runs and the summaries of
+    ``refit``.
 
 The resampling generator is ``default_rng([seed, fold, replicate])`` with the
 seed of the study, whatever the training seed of the run, so that every run of
@@ -1122,6 +1126,90 @@ def seed_mixture(labels: Sequence[str], report_dir: Path,
     return {"seeds": seeds, "mixture": pd.DataFrame(rows)}
 
 
+# Row of the summary of ``refit`` whose 95% interval the readings of the 2026 test
+# and of the minimal baselines use (plan §C.1; addendum 1, §3).
+READING_CONTRAST: str = "learner reselected in each replicate; rule refitted"
+
+
+def related_labels(label: str, report_dir: Path) -> Dict[str, str]:
+    """Labels of the 2026 test and of the minimal baselines of a specification.
+
+    They are the labels of the configuration of ``label``, read from its
+    metadata, with the 2026 test or with each minimal feature set.
+    """
+    from dataclasses import replace
+
+    from src.shap_blocks import run_config  # imports this module: imported here
+
+    config = run_config(label, report_dir)
+    return {"test": replace(config, holdout=True).label,
+            "timeonly": replace(config, feature_set="timeonly").label,
+            "spaceonly": replace(config, feature_set="spaceonly").label}
+
+
+def _reading_inputs(label: str, report_dir: Path, replicates: int) -> Optional[Dict[str, Any]]:
+    """Pre-specified difference, conditional interval and interval with the rule and learner refitted of a run.
+
+    ``None`` when the contrast of the run or the summary of its ``refit`` with
+    ``replicates`` replicates and without candidates is missing.
+    """
+    contrast = report_dir / f"contrast_primary_{label}.csv"
+    summary = report_dir / f"posthoc_refit_summary_{label}_r{replicates}.csv"
+    if not (contrast.exists() and summary.exists()):
+        return None
+    first = pd.read_csv(contrast).iloc[0]
+    row = pd.read_csv(summary).set_index("contrast").loc[READING_CONTRAST]
+    return {"label": label, "difference": float(first["delta_f1_macro"]),
+            "conditional_ci95_low": float(first["delta_f1_macro_ci95_low"]),
+            "conditional_ci95_high": float(first["delta_f1_macro_ci95_high"]),
+            "ci95_low": float(row["ci95_low"]), "ci95_high": float(row["ci95_high"]),
+            "replicates": int(row["replicates"]), "files": [contrast, summary]}
+
+
+def fixed_readings(label: str, report_dir: Path, replicates: int = REPLICATES) -> Tuple[pd.DataFrame, List[Path]]:
+    """Pre-specified readings of the 2026 test and of the minimal baselines of a specification.
+
+    The 95% interval of both is the one of ``READING_CONTRAST`` in the summary
+    of ``refit`` with ``replicates`` replicates, and the difference is the
+    pre-specified one of each run.
+
+    - §C.1: ``holdout_compatibility`` of the interval of the 2026 test and the
+      pre-specified difference of the folds of ``label``.
+    - §C.2: ``baseline_reading`` of each minimal baseline, whose difference is
+      the full baseline minus the minimal one (addendum 1, §3), and the row of
+      the smaller of the two differences, which the text uses.
+
+    A reading whose runs or summaries are missing is left out, and the folds
+    of ``label`` are always required.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, List[Path]]
+        One row per reading, and the files read.
+    """
+    folds = _reading_inputs(label, report_dir, replicates)
+    if folds is None:
+        raise FileNotFoundError(f"No contrast or summary of refit with {replicates} replicates for {label} "
+                                f"in {report_dir}")
+    labels = related_labels(label, report_dir)
+    rows, files = [], list(folds["files"])
+    test = _reading_inputs(labels["test"], report_dir, replicates)
+    if test is not None:
+        files += test.pop("files")
+        rows.append({"reading": "C.1 2026 test", **test, "folds_label": label,
+                     "folds_difference": folds["difference"],
+                     "result": holdout_compatibility(test["ci95_low"], test["ci95_high"], folds["difference"])})
+    baselines = {name: _reading_inputs(labels[name], report_dir, replicates) for name in ("timeonly", "spaceonly")}
+    if all(value is not None for value in baselines.values()):
+        for name, value in baselines.items():
+            files += value.pop("files")
+            rows.append({"reading": f"C.2 full baseline minus {name}", **value,
+                         "result": baseline_reading(value["difference"], value["ci95_low"], value["ci95_high"])})
+        smaller = min(rows[-2:], key=lambda row: row["difference"])
+        rows.append({**smaller, "reading": "C.2 smaller of the two differences (text)"})
+    return pd.DataFrame(rows), files
+
+
 # --- Command line -----------------------------------------------------------------------------------
 
 def _metadata(command: str, labels: Sequence[str], files: Sequence[Path], **settings: Any) -> Dict[str, Any]:
@@ -1151,7 +1239,7 @@ def _write(tables: Dict[str, pd.DataFrame], report_dir: Path, label: str, parque
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=["refit", "table", "describe", "mixture"])
+    parser.add_argument("command", choices=["refit", "table", "describe", "mixture", "readings"])
     parser.add_argument("--label", nargs="+", required=True, help="Label of the run; several for 'mixture'.")
     parser.add_argument("--replicates", type=int, default=None)
     parser.add_argument("--candidates", action="store_true",
@@ -1170,6 +1258,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         _write(seed_mixture(args.label, args.report_dir, replicates), args.report_dir, label)
         files = [path for name in args.label for path in mixture_source(name, args.report_dir, replicates)]
         meta = _metadata("mixture", args.label, files, replicates=replicates)
+    elif args.command == "readings":
+        replicates = args.replicates or REPLICATES
+        readings, files = fixed_readings(label, args.report_dir, replicates)
+        _write({"readings": readings}, args.report_dir, label)
+        print(readings.round(4).to_string(index=False) if len(readings) else "No reading has all its runs yet.")
+        meta = _metadata("readings", [label], files, replicates=replicates, contrast=READING_CONTRAST)
     elif args.command == "refit":
         strata = None
         if not args.no_strata:
