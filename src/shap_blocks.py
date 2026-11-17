@@ -44,6 +44,9 @@ from src.train_models import (CLASSES, MODELS, RANDOM_STATE, ExperimentConfig, S
 
 TREE_MODELS: Tuple[str, ...] = ("random_forest", "xgboost", "lightgbm")
 REPRODUCTION_TOLERANCE: float = 1e-6
+# Largest difference between the model probabilities and those rebuilt from the SHAP values
+# for the values of a fold to be used.
+ADDITIVITY_TOLERANCE: float = 1e-5
 TIMING_ROWS: int = 200
 MAX_HOURS_PER_FOLD: float = 2.0
 INTERVAL_REPLICATES: int = 2000
@@ -235,7 +238,8 @@ def explain_run(label: str, report_dir: Path, prediction_dir: Path, processed_di
         'checks' (per fold: learner, reproduction of the saved probabilities,
         additivity of the SHAP values, rows explained and time). A fold whose
         refitted model does not reproduce the saved probabilities is not
-        explained.
+        explained, and a fold whose SHAP values do not rebuild the probabilities
+        of the model within ``ADDITIVITY_TOLERANCE`` gives no shares.
     """
     config = run_config(label, report_dir)
     if config.holdout:
@@ -284,11 +288,14 @@ def explain_run(label: str, report_dir: Path, prediction_dir: Path, processed_di
                           "shap_seconds": round(time.time() - t0, 1),
                           "additivity_gap": additivity_gap(learner, frames["eval"].loc[rows], values, base),
                           "output": "probability" if model == "random_forest" else "margin"})
-            table = block_shares(values, features, dates.loc[rows].to_numpy(), dispatch, replicates)
-            shares.append(table.assign(fold=fold.name, model=model))
+            check["additive"] = check["additivity_gap"] <= ADDITIVITY_TOLERANCE
+            if check["additive"]:
+                table = block_shares(values, features, dates.loc[rows].to_numpy(), dispatch, replicates)
+                shares.append(table.assign(fold=fold.name, model=model))
         checks.append(check)
+        explained = check["reproduces_saved_predictions"] and check.get("additive", False)
         print(f"  {label} {fold.name} {model}: probability gap {gap:.2e}, "
-              f"{'explained' if check['reproduces_saved_predictions'] else 'NOT explained'}", flush=True)
+              f"{'explained' if explained else 'NOT explained'}", flush=True)
     shares = pd.concat(shares, ignore_index=True) if shares else pd.DataFrame(
         columns=["class", "block", "share", "ci95_low", "ci95_high", "fold", "model"])
     mean = shares.groupby(["class", "block"], sort=False)["share"].agg(["mean", "min", "max", "count"]).reset_index()

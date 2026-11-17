@@ -119,6 +119,17 @@ def test_refitted_model_reproduces_the_saved_predictions_before_anything_is_expl
     assert set(again["shares"]["fold"]) == {"2022-2023->2024"} and (again["mean"]["folds"] == 1).all()
 
 
+    # A fold whose SHAP values do not rebuild the probabilities of the model gives no shares.
+    saved.loc[tampered, "p0"] -= 1e-4
+    saved.to_parquet(path, index=False)
+    gaps = iter([sb.ADDITIVITY_TOLERANCE * 10, 0.0])
+    monkeypatch.setattr(sb, "additivity_gap", lambda *args: next(gaps))
+    checked = sb.explain_run(config.label, tmp_path, tmp_path, data, models=[model], replicates=50)
+    assert checked["checks"]["reproduces_saved_predictions"].all()
+    assert checked["checks"]["additive"].tolist() == [False, True]
+    assert set(checked["shares"]["fold"]) == {"2022-2024->2025"} and (checked["mean"]["folds"] == 1).all()
+
+
 def test_shap_is_refused_on_the_test_run_and_follows_the_options_of_the_run(synthetic_data, monkeypatch, tmp_path):
     data, _ = synthetic_data
     monkeypatch.setitem(tm.SEARCH_SPACES, "lightgbm", SMALL_SPACES["lightgbm"])
