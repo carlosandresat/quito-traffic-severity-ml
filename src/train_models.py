@@ -607,16 +607,17 @@ def contrast_reading(ci95_low: float, ci95_high: float, ci90_low: float, ci90_hi
 
 
 def holdout_reading(ci95_low: float, ci95_high: float) -> str:
-    """Pre-specified reading of the difference in macro F1 on the 2026 test.
+    """Whether the conditional 95% interval of the difference on the 2026 test contains zero.
 
     The test is descriptive: a single period is too small to read the equivalence
-    margin on it, so its difference is only said to be compatible with the result
-    of the folds when the 95% interval contains zero, and reported as it is
-    otherwise. Neither outcome changes the conclusion of the folds.
+    margin on it. This is not its pre-specified reading, which compares the 95%
+    interval with the learner and the decision rule refitted in every replicate
+    against the difference of the folds (``src.posthoc.holdout_compatibility``).
+    Neither outcome changes the conclusion of the folds.
     """
     if ci95_low > 0 or ci95_high < 0:
         return "95% interval excludes zero"
-    return "compatible with the folds"
+    return "95% interval contains zero"
 
 
 def trivial_references(y_fit: np.ndarray, y_eval: np.ndarray, n_draws: int = BOOTSTRAP_REPLICATES,

@@ -648,7 +648,7 @@ def test_test_run_is_contrasted_as_a_single_period(tmp_path):
     assert out["selection"]["model"].tolist() == ["lightgbm"]
     primary = out["primary"]
     assert primary["folds"].tolist() == ["holdout"] and primary["n_folds"].tolist() == [1]
-    assert primary.loc[0, "delta_f1_macro"] == 0 and primary.loc[0, "reading"] == "compatible with the folds"
+    assert primary.loc[0, "delta_f1_macro"] == 0 and primary.loc[0, "reading"] == "95% interval contains zero"
     assert {"delta_f1_macro_ci90_low", "delta_f1_macro_ci95_high", "delta_log_loss", "delta_pr_auc_2",
             "delta_log_loss_p_holm", "delta_pr_auc_2_p_holm"} <= set(primary.columns)
     secondary = out["secondary"].set_index("model")
@@ -864,8 +864,8 @@ def test_second_test_run_is_refused_before_reading_the_data(synthetic_study, tmp
 
 
 def test_reading_of_the_test_run_only_asks_whether_the_interval_contains_zero():
-    assert holdout_reading(-0.02, 0.03) == "compatible with the folds"
-    assert holdout_reading(0.0, 0.03) == "compatible with the folds"
+    assert holdout_reading(-0.02, 0.03) == "95% interval contains zero"
+    assert holdout_reading(0.0, 0.03) == "95% interval contains zero"
     assert holdout_reading(0.001, 0.03) == "95% interval excludes zero"
     assert holdout_reading(-0.03, -0.001) == "95% interval excludes zero"
 
