@@ -54,8 +54,8 @@ repo_root = current_dir.parent
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from src.decision import (DECISION_WEIGHT_GRID, EPSILON, N_CLASSES, apply_temperature, fit_temperature,
-                          rescale_prior)
+from src.decision import (DECISION_WEIGHT_GRID, EPSILON, N_CLASSES, DecisionRule, apply_temperature,
+                          fit_temperature, rescale_prior)
 from src.features import previous_hour_weather
 from src.train_models import (CONFIGS, EQUIVALENCE_MARGIN, MODELS, RANDOM_STATE, _sha256, contrast_reading,
                               selected_candidates)
@@ -469,7 +469,12 @@ def _resample(days: List[np.ndarray], rng: np.random.Generator) -> np.ndarray:
 
 
 def _replicate_fold(task: Tuple[int, List[int], int]) -> Tuple[List[tuple], List[tuple]]:
-    """Refits the rules of one fold on each resample; returns the fits and the confusion matrices."""
+    """Refits the rules of one fold on each resample; returns the fits and the confusion matrices.
+
+    In replicate 0 every refitted rule is also fitted with ``DecisionRule.fit``,
+    the reference of the decision stage, and must give the same temperature,
+    weights and decisions (plan §B.3).
+    """
     fold_id, replicates, seed = task
     run, rules = _STATE["run"], _STATE["rules"]
     fold, n_levels = run.folds[fold_id], len(run.level_names)
@@ -482,6 +487,14 @@ def _replicate_fold(task: Tuple[int, List[int], int]) -> Tuple[List[tuple], List
             for config in CONFIGS:
                 pv, pe = fold.proba[(model, config, "val")][iv], fold.proba[(model, config, "eval")][ie]
                 rule = Rule(pv, yv, fold.prior[(model, config)])
+                if b == 0:
+                    reference = DecisionRule.fit(pv, yv, fold.prior[(model, config)])
+                    if not (rule.temperature == reference.temperature
+                            and np.array_equal(rule.weights, reference.weights)
+                            and np.array_equal(rule.predict(pv), reference.predict(pv))
+                            and np.array_equal(rule.predict(pe), reference.predict(pe))):
+                        raise RuntimeError(f"The vectorized rule differs from DecisionRule.fit in replicate 0 of "
+                                           f"{fold.name}, {model}, {config}")
                 fits.append((b, fold.name, model, config, macro_f1(yv, rule.predict(pv)),
                              float(rule.weights[1]), float(rule.weights[2]), rule.temperature))
                 for kind, fitted in (("refit", rule), ("fixed", rules[fold_id][(model, config)])):

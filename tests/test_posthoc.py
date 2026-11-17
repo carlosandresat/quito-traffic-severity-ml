@@ -166,6 +166,24 @@ def test_refit_replicates_follow_the_reference_protocol(synthetic_run):
     assert summary["reselection"]["logistic"].tolist() == [1.0, 1.0]
 
 
+def test_refit_stops_if_the_vectorized_rule_differs_from_the_decision_stage(synthetic_run, monkeypatch):
+    tmp, label, _, _ = synthetic_run
+    calls = []
+    fit = ph.DecisionRule.fit
+    monkeypatch.setattr(ph.DecisionRule, "fit", classmethod(lambda cls, *args: calls.append(1) or fit(*args)))
+    ph.refit_replicates(label, tmp, tmp, replicates=2, models=["logistic"])
+    assert len(calls) == 2 * 2  # replicate 0 of the two folds, base and enriched
+    # A reference that departs from the vectorized search stops the run.
+    def departed(cls, *args):
+        rule = fit(*args)
+        rule.weights = rule.weights * np.array([1.0, 1.0, 1.25])
+        return rule
+
+    monkeypatch.setattr(ph.DecisionRule, "fit", classmethod(departed))
+    with pytest.raises(RuntimeError, match="differs from DecisionRule.fit in replicate 0"):
+        ph.refit_replicates(label, tmp, tmp, replicates=2, models=["logistic"])
+
+
 def test_candidate_replicates_repeat_the_selection_of_the_run(synthetic_run):
     tmp, label, _, _ = synthetic_run
     out = ph.refit_replicates(label, tmp, tmp, replicates=4, models=["logistic"], with_candidates=True)
