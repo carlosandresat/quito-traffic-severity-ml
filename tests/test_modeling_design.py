@@ -766,6 +766,17 @@ def test_placebo_keeps_the_weather_of_every_station_month_and_hour(synthetic_stu
     pd.testing.assert_frame_equal(placebo[untouched], observed[untouched], check_exact=True)
     assert (placebo.dtypes == observed.dtypes).all()
 
+    # The crashes of 2026 keep their own weather and give it to no other crash.
+    test_period = pd.to_datetime(observed["fecha"]).dt.year.to_numpy() == 2026
+    assert test_period.sum() > 50
+    pd.testing.assert_frame_equal(placebo[test_period], observed[test_period], check_exact=True)
+    assert not placebo.loc[~test_period, "tmp"].isin(observed.loc[test_period, "tmp"]).any()
+    # The exchange among the other crashes is the one they get without the 2026 rows.
+    pd.testing.assert_frame_equal(placebo[~test_period], placebo_weather(observed[~test_period], seed=1),
+                                  check_exact=True)
+    complete = observed, placebo
+    observed, placebo = observed[~test_period], placebo[~test_period]
+
     # Within every station x month x hour cell, the days with crashes carry the
     # observed weather records, whole (all the variables together), on other days.
     cell = ["estacion_climatica_utilizada", CLIMATE_MONTH, CLIMATE_HOUR]
@@ -784,6 +795,7 @@ def test_placebo_keeps_the_weather_of_every_station_month_and_hour(synthetic_stu
     alone = observed.groupby(cell)["fecha"].transform("nunique").to_numpy() == 1
     assert ((source != placebo["fecha"].to_numpy()) | alone).all() and alone.mean() < 0.05
     assert (pd.to_datetime(pd.Series(source)).dt.year.to_numpy() != pd.to_datetime(placebo["fecha"]).dt.year).mean() > 0.5
+    observed, placebo = complete
 
     pd.testing.assert_frame_equal(placebo, placebo_weather(observed, seed=1), check_exact=True)
     assert not placebo_weather(observed, seed=2)["tmp"].equals(placebo["tmp"])

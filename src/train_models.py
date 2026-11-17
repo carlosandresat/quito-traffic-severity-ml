@@ -760,7 +760,7 @@ def model_columns(model: str, config: str, raw_weather: bool, dispatch: bool = F
     return cols["numeric"], cols["categorical"]
 
 
-def placebo_weather(df: pd.DataFrame, seed: int) -> pd.DataFrame:
+def placebo_weather(df: pd.DataFrame, seed: int, last_year: int = 2025) -> pd.DataFrame:
     """Crashes with the weather block exchanged between days within each station x month x hour cell.
 
     A cell is the station that supplied the weather and the month and hour of
@@ -776,26 +776,35 @@ def placebo_weather(df: pd.DataFrame, seed: int) -> pd.DataFrame:
     of each crash is broken. Days of different years are exchanged, so the block
     does not mark the period either. The climatology is not affected.
 
+    Only the crashes up to ``last_year``, the last year a fold evaluates, take
+    part in the exchange: the crashes of the 2026 test period neither give nor
+    receive weather and keep their own, so no run of the folds depends on them.
+
     Parameters
     ----------
     df : pd.DataFrame
         Crashes after ``previous_hour_weather``.
     seed : int
         Seed of the exchange.
+    last_year : int
+        Last year of the crashes that take part in the exchange.
 
     Returns
     -------
     pd.DataFrame
-        Copy of ``df`` with the columns of ``WEATHER_SOURCE`` exchanged.
+        Copy of ``df`` with the columns of ``WEATHER_SOURCE`` exchanged among
+        the crashes up to ``last_year``.
     """
-    keys = pd.DataFrame({"station": df["estacion_climatica_utilizada"].astype(str).to_numpy(),
-                         "month": df[CLIMATE_MONTH].to_numpy(), "hour": df[CLIMATE_HOUR].to_numpy(),
-                         "day": pd.to_datetime(df["fecha"]).dt.normalize().to_numpy()})
+    eligible = np.flatnonzero(pd.to_datetime(df["fecha"]).dt.year.to_numpy() <= last_year)
+    part = df.iloc[eligible]
+    keys = pd.DataFrame({"station": part["estacion_climatica_utilizada"].astype(str).to_numpy(),
+                         "month": part[CLIMATE_MONTH].to_numpy(), "hour": part[CLIMATE_HOUR].to_numpy(),
+                         "day": pd.to_datetime(part["fecha"]).dt.normalize().to_numpy()})
     cell = ["station", "month", "hour"]
     day_id = keys.groupby(cell + ["day"], sort=True).ngroup().to_numpy()
     # One entry per cell and day, in the order of ``day_id``: its cell and one of its crashes.
     days = pd.DataFrame({"cell": keys.groupby(cell, sort=True).ngroup().to_numpy(),
-                         "position": np.arange(len(df))}).groupby(day_id).first()
+                         "position": np.arange(len(part))}).groupby(day_id).first()
     days["draw"] = np.random.default_rng(seed).random(len(days))
     ordered = days.sort_values(["cell", "draw"])
     rank = ordered.groupby("cell").cumcount().to_numpy()
@@ -803,7 +812,10 @@ def placebo_weather(df: pd.DataFrame, seed: int) -> pd.DataFrame:
     next_in_cell = np.arange(len(ordered)) - rank + (rank + 1) % size
     source = pd.Series(ordered["position"].to_numpy()[next_in_cell], index=ordered.index)
     out = df.copy()
-    out[WEATHER_SOURCE] = df[WEATHER_SOURCE].to_numpy()[source.loc[day_id].to_numpy()]
+    # A copy: with copy-on-write the array of the frame may be read-only.
+    values = df[WEATHER_SOURCE].to_numpy(copy=True)
+    values[eligible] = values[eligible][source.loc[day_id].to_numpy()]
+    out[WEATHER_SOURCE] = values
     return out
 
 
