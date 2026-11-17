@@ -15,9 +15,6 @@ scipy==1.17.1  # VERIFY against the Colab environment
 # File Formats and I/O
 openpyxl==3.1.5  # VERIFY against the Colab environment
 pyarrow==25.0.1  # VERIFY against the Colab environment
-# Not imported by any module and absent from the development environment, so no
-# version can be pinned: VERIFY against the Colab environment or remove.
-fastparquet>=2023.4.0
 
 # Machine Learning & Metrics
 scikit-learn==1.9.0
