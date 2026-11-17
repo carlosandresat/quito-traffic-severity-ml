@@ -68,15 +68,14 @@ def feature_block(feature: str, dispatch: Sequence[str] = ()) -> str:
 
 def run_config(label: str, report_dir: Path) -> ExperimentConfig:
     """Configuration of a run, from the metadata it wrote."""
-    paths = sorted(report_dir.glob(f"run_metadata_{label}_*.json"))
-    if not paths:
-        raise FileNotFoundError(f"No run metadata for {label} in {report_dir}")
-    stored = json.loads(paths[0].read_text(encoding="utf-8"))["config"]
     known = {f.name for f in fields(ExperimentConfig)}
-    config = ExperimentConfig(**{k: v for k, v in stored.items() if k in known and k != "models"})
-    if config.label != label:
-        raise ValueError(f"The metadata of {paths[0].name} describe the run {config.label}, not {label}")
-    return config
+    # The pattern also matches longer labels that start with this one (other seeds, budgets or options).
+    for path in sorted(report_dir.glob(f"run_metadata_{label}_*.json")):
+        stored = json.loads(path.read_text(encoding="utf-8"))["config"]
+        config = ExperimentConfig(**{k: v for k, v in stored.items() if k in known and k != "models"})
+        if config.label == label:
+            return config
+    raise FileNotFoundError(f"No run metadata for {label} in {report_dir}")
 
 
 def tree_selection(tuning: pd.DataFrame, shared: bool) -> Dict[str, Tuple[str, bool]]:

@@ -136,3 +136,22 @@ def test_shap_is_refused_on_the_test_run_and_follows_the_options_of_the_run(synt
     assert out["checks"]["reproduces_saved_predictions"].all()
     with pytest.raises(FileNotFoundError):
         sb.run_config("anomalies_from2019", tmp_path)
+
+
+def test_the_configuration_of_a_run_is_read_from_its_own_metadata_among_longer_labels(tmp_path):
+    import json
+    from dataclasses import asdict
+
+    main = ExperimentConfig()
+    others = [ExperimentConfig(n_candidates=12, bootstrap_replicates=2000, seed=20261025),
+              ExperimentConfig(n_candidates=2, bootstrap_replicates=2000, seed=20261024)]
+    # Both longer labels start with the main one and sort before it in the folder.
+    names = [f"run_metadata_{c.label}_{'-'.join(c.models)}.json" for c in (main, *others)]
+    assert all(c.label.startswith(main.label + "_") for c in others) and sorted(names)[-1] == names[0]
+    for config, name in zip((main, *others), names):
+        (tmp_path / name).write_text(json.dumps({"config": asdict(config)}), encoding="utf-8")
+    assert sb.run_config(main.label, tmp_path) == main
+    for config in others:
+        assert sb.run_config(config.label, tmp_path) == config
+    with pytest.raises(FileNotFoundError):
+        sb.run_config(main.label, tmp_path / "missing")
