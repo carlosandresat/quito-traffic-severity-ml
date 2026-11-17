@@ -42,7 +42,10 @@ def build_binary_risk_factors(df: pd.DataFrame) -> pd.DataFrame:
         Copy of the dataset with the risk factor columns appended.
     """
     out = df.copy()
-    out["is_raining"] = (out["lluvia_1h"] > 0.1).astype("Int8").mask(out["lluvia_1h"].isna())
+    # More than 0.1 mm in the hour, as 'lluvia_flag' (``ingest_remmaq``). The series
+    # is recorded in steps of 0.1 mm, so the threshold sits between two readings
+    # and the indicator does not depend on the floating-point type of the column.
+    out["is_raining"] = (out["lluvia_1h"] > 0.15).astype("Int8").mask(out["lluvia_1h"].isna())
     out["is_antecedent_rain"] = (
         (out["lluvia_acum_3h"] > 0.5).astype("Int8").mask(out["lluvia_acum_3h"].isna())
     )
