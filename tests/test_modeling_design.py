@@ -1073,8 +1073,17 @@ def test_run_of_the_four_learners_ends_with_the_printed_contrast_and_a_canary(sy
     learners with a reduced budget finish with the printed selection, and the
     metadata record the predictions written, whose content gives the canary."""
     import json
+    import os
     import src.train_models as tm
     monkeypatch.setattr(tm, "effective_cpu_count", lambda: tm.XGBOOST_N_THREADS)
+    replaced = []
+    real_replace = os.replace
+
+    def recording_replace(source, target):
+        replaced.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", recording_replace)
     for name, space in {
         "random_forest": {"n_estimators": [20], "max_depth": [4, 8], "min_samples_leaf": [5, 20],
                           "max_features": ["sqrt"]},
@@ -1099,6 +1108,16 @@ def test_run_of_the_four_learners_ends_with_the_printed_contrast_and_a_canary(sy
     assert out["contrast"]["selection"]["fold"].tolist() == ["2022-2023->2024", "2022-2024->2025"]
     assert all(model in printed for model in out["contrast"]["selection"]["model"])
     assert (reports / f"contrast_selection_{config.label}.csv").exists()
+
+    # The table shared by the learners is moved into place whole, once per learner,
+    # from a file of the process that no pattern of the run files matches.
+    trivial = reports / f"trivial_references_{config.label}.csv"
+    moves = [(source, target) for source, target in replaced if target == trivial]
+    assert len(moves) == len(MODELS)
+    assert all(source.parent == reports and source.name.startswith(".") and source.suffix == ".tmp"
+               and not source.exists() for source, _ in moves)
+    assert not list(reports.glob("*.tmp")) and not list(reports.glob(f"*_{config.label}.csv.*"))
+    pd.testing.assert_frame_equal(pd.read_csv(trivial), out[MODELS[-1]]["trivial"], check_dtype=False)
 
     # Every file of predictions is recorded with the hash of its bytes and of its content.
     meta = json.loads((reports / f"run_metadata_{config.label}_{'-'.join(MODELS)}.json").read_text("utf-8"))

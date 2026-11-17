@@ -1412,7 +1412,12 @@ def main(
             out["candidates"].to_parquet(prediction_dir / f"{model}_candidates_{config.label}.parquet",
                                          index=False)
             # The same table for every learner: it only depends on the folds and the seed.
-            out["trivial"].to_csv(report_dir / f"trivial_references_{config.label}.csv", index=False)
+            # Two processes of one run may write it at once, so each writes a file of
+            # its own and moves it into place, which replaces the table whole.
+            trivial_path = report_dir / f"trivial_references_{config.label}.csv"
+            partial = trivial_path.with_name(f".{trivial_path.name}.{os.getpid()}.tmp")
+            out["trivial"].to_csv(partial, index=False)
+            os.replace(partial, trivial_path)
             pooled = out["pooled"].iloc[0]
             print(f"  pooled delta F1 {pooled['delta_f1_macro']:+.4f} "
                   f"[{pooled['delta_f1_macro_ci95_low']:+.4f}, {pooled['delta_f1_macro_ci95_high']:+.4f}], "
