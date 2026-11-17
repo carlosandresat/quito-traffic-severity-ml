@@ -222,3 +222,96 @@ def test_conditional_table_and_descriptions_on_a_synthetic_run(synthetic_run):
         assert collapse.loc[(fold_config, "roc_auc"), "value"] == pytest.approx(np.mean(aucs))
     low, high = collapse.loc[("enriched minus base", "roc_auc"), ["ci95_low", "ci95_high"]]
     assert low < high
+
+
+# --- Files of refit and seed mixture ------------------------------------------------------
+
+def _refit_tables(replicates: int, seed: int):
+    """Refitted rules and overall confusion matrices of a run of ``refit``, with random contents."""
+    rng = np.random.default_rng(seed)
+    keys = [(b, fold, model, config) for b in range(replicates) for fold in ("2017-2023->2024", "2017-2024->2025")
+            for model in ("logistic", "lightgbm") for config in ph.CONFIGS]
+    fits = pd.DataFrame(keys, columns=["b", "fold", "model", "config"])
+    fits["val_f1"] = rng.random(len(fits))
+    confusions = fits[["b", "fold", "model", "config"]].assign(rule="refit", level="all", stratum="all")
+    confusions[ph.CONFUSION_COLUMNS] = rng.integers(1, 60, size=(len(confusions), 9))
+    return fits, confusions
+
+
+def _write_refit(report_dir, tag, fits, confusions):
+    fits.to_parquet(report_dir / f"posthoc_fits_{tag}.parquet", index=False)
+    confusions.to_parquet(report_dir / f"posthoc_confusions_{tag}.parquet", index=False)
+
+
+def test_seed_mixture_takes_the_first_400_replicates_of_every_seed(tmp_path):
+    first = {"delta_f1_macro": 0.001, "delta_f1_macro_ci95_low": -0.01, "delta_f1_macro_ci95_high": 0.012,
+             "delta_f1_macro_ci90_low": -0.008, "delta_f1_macro_ci90_high": 0.01, "reading": "equivalent"}
+    main, other = "anomalies", "anomalies_s20261101"
+    full = {}
+    for label, seed in ((main, 1), (other, 2)):
+        pd.DataFrame([first]).to_csv(tmp_path / f"contrast_primary_{label}.csv", index=False)
+        full[label] = _refit_tables(1000, seed)
+    # The main run has 1,000 replicates; the other seed, 400 and a run with candidates that must be ignored.
+    _write_refit(tmp_path, f"{main}_r1000", *full[main])
+    _write_refit(tmp_path, f"{other}_r400", *(t[t["b"] < 400] for t in full[other]))
+    _write_refit(tmp_path, f"{other}_r1000_candidates", *_refit_tables(1000, 3))
+    assert ph.mixture_source(main, tmp_path) == (tmp_path / f"posthoc_confusions_{main}_r1000.parquet",
+                                                 tmp_path / f"posthoc_fits_{main}_r1000.parquet")
+    assert ph.mixture_source(other, tmp_path)[0].name == f"posthoc_confusions_{other}_r400.parquet"
+    out = ph.seed_mixture([main, other], tmp_path)
+    assert out["seeds"]["replicates"].tolist() == [400, 400]
+
+    # The same mixture as with the first 400 replicates of each seed alone.
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    for label in (main, other):
+        pd.DataFrame([first]).to_csv(alone / f"contrast_primary_{label}.csv", index=False)
+        _write_refit(alone, f"{label}_r400", *(t[t["b"] < 400] for t in full[label]))
+    expected = ph.seed_mixture([main, other], alone)
+    pd.testing.assert_frame_equal(out["seeds"], expected["seeds"])
+    pd.testing.assert_frame_equal(out["mixture"], expected["mixture"])
+
+    # A seed with fewer replicates, or with only a run with candidates, cannot enter the mixture.
+    short = "anomalies_s20261102"
+    pd.DataFrame([first]).to_csv(tmp_path / f"contrast_primary_{short}.csv", index=False)
+    _write_refit(tmp_path, f"{short}_r300", *_refit_tables(300, 4))
+    _write_refit(tmp_path, f"{short}_r400_candidates", *_refit_tables(400, 5))
+    with pytest.raises(FileNotFoundError, match="at least 400 replicates"):
+        ph.seed_mixture([main, other, short], tmp_path)
+    # A file whose name promises replicates that it does not hold is refused.
+    _write_refit(tmp_path, f"{short}_r400", *(t[t["b"] < 399] for t in _refit_tables(400, 6)))
+    with pytest.raises(ValueError, match="first 400 replicates"):
+        ph.seed_mixture([main, other, short], tmp_path)
+
+
+def test_runs_of_refit_with_another_budget_or_with_candidates_write_files_of_their_own(synthetic_run, monkeypatch):
+    tmp, label, _, _ = synthetic_run
+    refit = ph.refit_replicates
+    monkeypatch.setattr(ph, "refit_replicates", lambda *args, **kwargs: refit(*args, models=["logistic"], **kwargs))
+    common = ["--label", label, "--report-dir", str(tmp), "--prediction-dir", str(tmp), "--no-strata",
+              "--workers", "1"]
+    ph.main(["refit", "--replicates", "3", *common])
+    ph.main(["refit", "--replicates", "2", "--candidates", *common])
+    for tag, replicates in ((f"{label}_r3", 3), (f"{label}_r2_candidates", 2)):
+        confusions = pd.read_parquet(tmp / f"posthoc_confusions_{tag}.parquet")
+        assert sorted(confusions["b"].unique()) == list(range(replicates))
+        for name in (f"posthoc_fits_{tag}.parquet", f"posthoc_refit_summary_{tag}.csv",
+                     f"posthoc_metadata_refit_{tag}.json"):
+            assert (tmp / name).exists()
+    assert (tmp / f"posthoc_candidates_{label}_r2_candidates.parquet").exists()
+    for name in ("fits", "confusions"):  # the names without replicates are no longer written
+        assert not (tmp / f"posthoc_{name}_{label}.parquet").exists()
+    assert not list(tmp.glob(f"posthoc_refit_*_{label}.csv")) and not list(tmp.glob(f"posthoc_metadata_refit_{label}.json"))
+    # The mixture reads the run without candidates; the one with candidates does not count. A run of
+    # a single learner writes no pre-specified contrast, so one is written here.
+    contrast = tmp / f"contrast_primary_{label}.csv"
+    pd.DataFrame([{"delta_f1_macro": 0.0, "delta_f1_macro_ci95_low": -0.01, "delta_f1_macro_ci95_high": 0.01,
+                   "delta_f1_macro_ci90_low": -0.008, "delta_f1_macro_ci90_high": 0.008,
+                   "reading": "equivalent"}]).to_csv(contrast, index=False)
+    try:
+        ph.main(["mixture", "--replicates", "3", *common[:4]])
+        assert pd.read_csv(tmp / f"posthoc_seeds_{label}.csv")["replicates"].tolist() == [3]
+        with pytest.raises(FileNotFoundError):
+            ph.main(["mixture", "--replicates", "4", *common[:4]])
+    finally:
+        contrast.unlink()

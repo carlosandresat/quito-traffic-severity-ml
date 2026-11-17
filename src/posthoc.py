@@ -33,6 +33,7 @@ the same folds sees the same resampled days.
 
 import argparse
 import json
+import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -56,6 +57,8 @@ from src.train_models import (CONFIGS, EQUIVALENCE_MARGIN, MODELS, RANDOM_STATE,
                               selected_candidates)
 
 REPLICATES: int = 1000
+# Replicates of every seed in the seed mixture (plan §B.4).
+MIXTURE_REPLICATES: int = 400
 CONDITIONAL_REPLICATES: int = 2000
 EVERYTHING: Tuple[str, str] = ("all", "all")
 
@@ -1031,11 +1034,42 @@ READING_GROUPS: Dict[str, str] = {
     "worsening": "worsening", "worsening smaller than the margin": "worsening", "inconclusive": "inconclusive"}
 
 
-def seed_mixture(labels: Sequence[str], report_dir: Path) -> Dict[str, pd.DataFrame]:
+def mixture_source(label: str, report_dir: Path, replicates: int = MIXTURE_REPLICATES) -> Tuple[Path, Path]:
+    """Files of ``refit`` that the seed mixture reads for a run.
+
+    The run of ``refit`` without candidates, among those with at least
+    ``replicates`` replicates, that has the fewest. Its first ``replicates``
+    replicates are those of any other such run of the same label, because
+    replicate ``b`` of a fold always draws the same days.
+
+    Returns
+    -------
+    Tuple[Path, Path]
+        The confusion matrices and the refitted rules.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no such run of ``refit`` exists for the label.
+    """
+    pattern = re.compile(rf"posthoc_confusions_{re.escape(label)}_r(\d+)\.parquet")
+    found = sorted((int(match.group(1)), path) for path in report_dir.glob(f"posthoc_confusions_{label}_r*.parquet")
+                   if (match := pattern.fullmatch(path.name)) and int(match.group(1)) >= replicates)
+    if not found:
+        raise FileNotFoundError(f"No run of refit without candidates and with at least {replicates} replicates "
+                                f"for {label} in {report_dir}")
+    n, confusions = found[0]
+    return confusions, report_dir / f"posthoc_fits_{label}_r{n}.parquet"
+
+
+def seed_mixture(labels: Sequence[str], report_dir: Path,
+                 replicates: int = MIXTURE_REPLICATES) -> Dict[str, pd.DataFrame]:
     """Combines the runs of the same specification that differ in the training seed.
 
     Reads, for every label, the pre-specified contrast written by the run and
-    the replicates of ``refit`` (which share the resampled days across seeds).
+    the first ``replicates`` replicates of ``refit`` (which share the resampled
+    days across seeds), from the files given by ``mixture_source``, so that
+    every seed weighs the same in the mixture.
 
     Returns
     -------
@@ -1052,8 +1086,11 @@ def seed_mixture(labels: Sequence[str], report_dir: Path) -> Dict[str, pd.DataFr
                          "mean of the learners; rule refitted": []}
     for label in labels:
         first = pd.read_csv(report_dir / f"contrast_primary_{label}.csv").iloc[0]
-        confusions = pd.read_parquet(report_dir / f"posthoc_confusions_{label}.parquet")
-        fits = pd.read_parquet(report_dir / f"posthoc_fits_{label}.parquet")
+        confusions_path, fits_path = mixture_source(label, report_dir, replicates)
+        confusions, fits = pd.read_parquet(confusions_path), pd.read_parquet(fits_path)
+        if not set(range(replicates)) <= set(confusions["b"]) or not set(range(replicates)) <= set(fits["b"]):
+            raise ValueError(f"{confusions_path.name} lacks some of the first {replicates} replicates")
+        confusions, fits = confusions[confusions["b"] < replicates], fits[fits["b"] < replicates]
         overall = confusions[(confusions["stratum"] == EVERYTHING[0]) & (confusions["rule"] == "refit")]
         delta = _delta(overall, ["b", "fold", "model"]).rename("delta").reset_index()
         val = fits.pivot_table(index=["b", "fold", "model"], columns="config", values="val_f1").mean(axis=1)
@@ -1126,23 +1163,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--no-strata", action="store_true", help="'refit': skip the differences by stratum.")
     args = parser.parse_args(argv)
     started, label = time.time(), args.label[0]
+    tag = label
 
     if args.command == "mixture":
-        _write(seed_mixture(args.label, args.report_dir), args.report_dir, label)
-        files = [args.report_dir / f"posthoc_confusions_{name}.parquet" for name in args.label]
-        meta = _metadata("mixture", args.label, files)
+        replicates = args.replicates or MIXTURE_REPLICATES
+        _write(seed_mixture(args.label, args.report_dir, replicates), args.report_dir, label)
+        files = [path for name in args.label for path in mixture_source(name, args.report_dir, replicates)]
+        meta = _metadata("mixture", args.label, files, replicates=replicates)
     elif args.command == "refit":
         strata = None
         if not args.no_strata:
             df = pd.read_parquet(args.processed_dir / "integrated_traffic_weather_quito.parquet")
             strata = strata_table(df, pd.read_parquet(args.processed_dir / "remmaq_meteorology_hourly.parquet"))
         replicates = args.replicates or REPLICATES
+        # Runs of refit with another number of replicates or with candidates write files of their own.
+        tag = f"{label}_r{replicates}" + ("_candidates" if args.candidates else "")
         results = refit_replicates(label, args.report_dir, args.prediction_dir, replicates, strata=strata,
                                    with_candidates=args.candidates, workers=args.workers)
-        _write(results, args.report_dir, label, parquet=("fits", "confusions", "candidates"))
+        _write(results, args.report_dir, tag, parquet=("fits", "confusions", "candidates"))
         run = _STATE["run"]
         summary = summarize_refit(results, run.selection)
-        _write({f"refit_{name}": table for name, table in summary.items()}, args.report_dir, label)
+        _write({f"refit_{name}": table for name, table in summary.items()}, args.report_dir, tag)
         print(summary["summary"].round(4).to_string(index=False))
         meta = _metadata("refit", [label], run.files, replicates=replicates, seed=RANDOM_STATE,
                          candidates=args.candidates, strata=not args.no_strata)
@@ -1160,7 +1201,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     "binary_collapse": binary_collapse(run, replicates)}, args.report_dir, label)
         meta = _metadata(args.command, [label], run.files, replicates=replicates, seed=RANDOM_STATE)
     meta["elapsed_seconds"] = round(time.time() - started, 1)
-    (args.report_dir / f"posthoc_metadata_{args.command}_{label}.json").write_text(
+    (args.report_dir / f"posthoc_metadata_{args.command}_{tag}.json").write_text(
         json.dumps(meta, indent=2, default=str), encoding="utf-8")
     print(f"Completed in {meta['elapsed_seconds']} s")
 
