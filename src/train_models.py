@@ -1168,6 +1168,25 @@ def effective_cpu_count() -> int:
         return os.cpu_count() or 1
 
 
+def xgboost_thread_limit() -> int:
+    """Threads XGBoost may use with its fixed thread count.
+
+    Returns
+    -------
+    int
+        The effective cores (``effective_cpu_count``), bounded by the OpenMP
+        limits of the environment: the first level of ``OMP_NUM_THREADS`` and
+        ``OMP_THREAD_LIMIT``, when they hold a positive integer. Under a lower
+        limit XGBoost fits, without warning, the model of fewer threads.
+    """
+    limits = [effective_cpu_count()]
+    for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT"):
+        first = os.environ.get(name, "").split(",")[0].strip()
+        if first.isdigit() and int(first) > 0:
+            limits.append(int(first))
+    return min(limits)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -1369,10 +1388,10 @@ def main(
 
     results: Dict[str, Any] = {}
     if not summarize_only:
-        if "xgboost" in config.models and effective_cpu_count() < XGBOOST_N_THREADS:
+        if "xgboost" in config.models and xgboost_thread_limit() < XGBOOST_N_THREADS:
             raise RuntimeError(
                 f"XGBoost needs {XGBOOST_N_THREADS} cores to reproduce the study; "
-                f"this machine offers {effective_cpu_count()}.")
+                f"this machine and its OpenMP settings allow {xgboost_thread_limit()}.")
         if config.holdout:
             previous = existing_test_results(config.models, report_dir, prediction_dir)
             if previous:

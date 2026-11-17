@@ -1130,6 +1130,35 @@ def test_xgboost_is_refused_before_reading_data_when_cores_are_fewer_than_thread
     assert run(["xgboost"], 1, summarize_only=True) == {}
 
 
+def test_xgboost_is_refused_when_the_openmp_settings_allow_fewer_threads(monkeypatch, tmp_path):
+    """Under OMP_NUM_THREADS or OMP_THREAD_LIMIT below its thread count, XGBoost
+    fits the model of fewer threads without warning, whatever the cores."""
+    import src.train_models as tm
+    monkeypatch.setattr(tm, "effective_cpu_count", lambda: 8)
+    for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT"):
+        monkeypatch.delenv(name, raising=False)
+    assert tm.xgboost_thread_limit() == 8
+    for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT"):
+        with monkeypatch.context() as env:
+            env.setenv(name, str(tm.XGBOOST_N_THREADS - 1))
+            assert tm.xgboost_thread_limit() == tm.XGBOOST_N_THREADS - 1
+            with pytest.raises(RuntimeError, match="OpenMP settings allow"):
+                train_main(ExperimentConfig(models=["xgboost"]), report_dir=tmp_path, prediction_dir=tmp_path,
+                           processed_dir=tmp_path / "no_data")
+            # Without XGBoost the run goes on to read the data.
+            with pytest.raises(FileNotFoundError):
+                train_main(ExperimentConfig(models=["lightgbm"]), report_dir=tmp_path, prediction_dir=tmp_path,
+                           processed_dir=tmp_path / "no_data")
+    # A list of nested levels counts by its first one; values that are not a positive integer are ignored.
+    monkeypatch.setenv("OMP_NUM_THREADS", "2,1")
+    assert tm.xgboost_thread_limit() == 2
+    for value in ("", "0", "auto"):
+        monkeypatch.setenv("OMP_NUM_THREADS", value)
+        assert tm.xgboost_thread_limit() == 8
+    monkeypatch.setenv("OMP_NUM_THREADS", "16")
+    assert tm.xgboost_thread_limit() == 8
+
+
 def test_run_metadata_records_the_effective_cores(monkeypatch, tmp_path):
     import src.train_models as tm
     monkeypatch.setattr(tm, "effective_cpu_count", lambda: 3)
