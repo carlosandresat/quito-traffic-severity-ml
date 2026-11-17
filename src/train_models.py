@@ -30,8 +30,10 @@ Results do not depend on the hardware: the tuning budget is a parameter of the
 study with fixed defaults, all randomness is seeded, LightGBM runs in its
 deterministic mode, XGBoost uses a fixed number of threads (its subsampling
 depends on it) and is refused on a machine that offers fewer cores, and Random
-Forest predicts on one thread. Every run writes the versions, budget, seed,
-hardware, input hashes and run time next to its results.
+Forest predicts on one thread. Every run writes next to its results the commit
+and tag, the installed packages, the budget and seed, the hardware and thread
+settings, the hashes of its inputs and of the predictions it wrote, the canary
+of the session and the run time.
 
 Sensitivity analyses change one decision each and keep everything else: the
 training window, the weather mark, raw weather, independent hyperparameters, the
@@ -65,6 +67,7 @@ results of a test run, whatever their budget, seed or options.
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -125,6 +128,17 @@ BOOTSTRAP_REPLICATES: int = 2000
 # fit another model without warning: ``main`` refuses such a run.
 # LightGBM (deterministic mode) and Random Forest do not depend on it.
 XGBOOST_N_THREADS: int = 4
+
+# Environment variables that bound the threads of the numerical libraries; they
+# are recorded with every run because XGBoost depends on its thread count.
+THREAD_VARIABLES: Tuple[str, ...] = (
+    "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS", "LOKY_MAX_CPU_COUNT")
+
+# Environment variable through which a session passes its canary to every run:
+# the content hash of the predictions of a short run (``session_canary``), which
+# must be the same in every session of the study.
+CANARY_VARIABLE: str = "SEVERITY_SESSION_CANARY"
 
 # Categories seen fewer times than this in training are pooled, so that sparse
 # 5 km cells do not become near-singular dummy columns.
@@ -1149,9 +1163,94 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def run_metadata(config: ExperimentConfig, inputs: List[Path], started: float, finished: float
-                 ) -> Dict[str, Any]:
-    """Provenance of a run: code version, environment, budget, inputs and time.
+def content_sha256(frame: pd.DataFrame, decimals: Optional[int] = None) -> str:
+    """SHA-256 of the values of a table, whatever file stores them.
+
+    The hash covers the column names and the values, with the columns sorted by
+    name and the rows sorted by every column that is not floating, so that it
+    depends neither on the order of rows and columns nor on the library version
+    that wrote the file, as the bytes of a Parquet file do.
+
+    Parameters
+    ----------
+    frame : pd.DataFrame
+        Table whose non-floating columns identify its rows.
+    decimals : Optional[int]
+        Round the floating values before hashing them. By default they are
+        hashed bit by bit; a rounded hash tells a difference in the last bits
+        from a difference in the results.
+
+    Returns
+    -------
+    str
+        Hexadecimal digest.
+    """
+    columns = sorted(frame.columns)
+    keys = [c for c in columns if not pd.api.types.is_float_dtype(frame[c])]
+    ordered = frame.sort_values(keys, kind="mergesort") if keys else frame
+    digest = hashlib.sha256()
+    for column in columns:
+        values = ordered[column]
+        digest.update(str(column).encode("utf-8") + b"\x00")
+        if pd.api.types.is_float_dtype(values):
+            array = values.to_numpy(dtype="<f8", copy=True)
+            if decimals is not None:
+                array = np.round(array, decimals) + 0.0
+            array[np.isnan(array)] = np.nan
+            digest.update(array.tobytes())
+        elif pd.api.types.is_integer_dtype(values) and not values.isna().any():
+            digest.update(values.to_numpy(dtype="<i8").tobytes())
+        else:
+            digest.update("\x1f".join(values.astype(str)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def session_canary(prediction_dir: Path, label: str, models: Optional[List[str]] = None,
+                   decimals: Optional[int] = None) -> str:
+    """Content hash of the predictions of a run, used as the canary of a session.
+
+    Parameters
+    ----------
+    prediction_dir : Path
+        Where ``main`` saved the predictions.
+    label : str
+        Label of the run (``ExperimentConfig.label``).
+    models : Optional[List[str]]
+        Learners whose predictions enter the hash; defaults to all four.
+    decimals : Optional[int]
+        See ``content_sha256``.
+
+    Returns
+    -------
+    str
+        Hexadecimal digest of the selected candidates' predictions of those learners.
+    """
+    frames = [pd.read_parquet(prediction_dir / f"{model}_predictions_{label}.parquet")
+              for model in (models or MODELS)]
+    return content_sha256(pd.concat(frames, ignore_index=True), decimals)
+
+
+def _cpu_model() -> Optional[str]:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or None
+
+
+def _installed(package: str) -> Optional[str]:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def run_metadata(config: ExperimentConfig, inputs: List[Path], started: float, finished: float,
+                 outputs: Optional[List[Path]] = None) -> Dict[str, Any]:
+    """Provenance of a run: code version, environment, budget, inputs, outputs and time.
 
     Parameters
     ----------
@@ -1161,11 +1260,16 @@ def run_metadata(config: ExperimentConfig, inputs: List[Path], started: float, f
         Input files, hashed so that a rerun can verify it used the same data.
     started, finished : float
         Epoch times of the run.
+    outputs : Optional[List[Path]]
+        Parquet files of predictions written by the run. Each is recorded with
+        the hash of its bytes and with the hash of its content, which does not
+        depend on the library that wrote it.
 
     Returns
     -------
     Dict[str, Any]
-        JSON-serializable metadata.
+        JSON-serializable metadata. 'session_canary_sha256' is the value of
+        ``CANARY_VARIABLE`` in the environment, None when the session set none.
     """
     def git(*args: str) -> Optional[str]:
         try:
@@ -1179,17 +1283,26 @@ def run_metadata(config: ExperimentConfig, inputs: List[Path], started: float, f
         "search_spaces": SEARCH_SPACES,
         "fixed_threads": {"xgboost": XGBOOST_N_THREADS, "random_forest_predict": 1},
         "git_commit": git("rev-parse", "HEAD"),
+        "git_tag": git("describe", "--tags", "--exact-match"),
         # Only tracked files count: result files written by a parallel run are untracked.
         "git_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
         "python": platform.python_version(),
         "packages": {"numpy": np.__version__, "pandas": pd.__version__,
                      "scikit-learn": sklearn.__version__, "xgboost": xgb.__version__,
-                     "lightgbm": lgb.__version__},
+                     "lightgbm": lgb.__version__,
+                     **{name: _installed(name) for name in ("scipy", "pyarrow", "imbalanced-learn", "shap")}},
+        "installed_packages": sorted({f"{dist.metadata['Name']}=={dist.version}"
+                                      for dist in importlib.metadata.distributions() if dist.metadata["Name"]}),
         "platform": platform.platform(),
         "processor": platform.processor(),
+        "cpu_model": _cpu_model(),
         "cpu_count": os.cpu_count(),
         "effective_cpu_count": effective_cpu_count(),
+        "thread_environment": {name: os.environ.get(name) for name in THREAD_VARIABLES},
         "inputs": {p.name: _sha256(p) for p in inputs},
+        "outputs": {p.name: {"sha256": _sha256(p), "content_sha256": content_sha256(pd.read_parquet(p))}
+                    for p in (outputs or [])},
+        "session_canary_sha256": os.environ.get(CANARY_VARIABLE),
         "started_utc": datetime.fromtimestamp(started, timezone.utc).isoformat(),
         "elapsed_seconds": round(finished - started, 1),
     }
@@ -1273,7 +1386,9 @@ def main(
                   f"positive in {pooled['folds_positive']}/{pooled['n_folds']} folds, {pooled['reading']} "
                   f"({time.time() - t0:.0f} s)", flush=True)
             results[model] = out
-        metadata = run_metadata(config, inputs, started, time.time())
+        written = [prediction_dir / f"{model}_{kind}_{config.label}.parquet"
+                   for model in config.models for kind in ("predictions", "candidates")]
+        metadata = run_metadata(config, inputs, started, time.time(), outputs=written)
         (report_dir / f"run_metadata_{config.label}_{'-'.join(config.models)}.json").write_text(
             json.dumps(metadata, indent=2, default=str), encoding="utf-8")
 

@@ -1,27 +1,38 @@
+# Exact versions of the frozen modeling environment (Python 3.13.18).
+#
+# numpy, pandas, scikit-learn, xgboost and lightgbm are the versions recorded in
+# the run metadata of the confirmatory runs of 30 October 2026. imbalanced-learn
+# and shap are the versions pinned and confirmed by the notebooks that executed
+# the runs of 30 and 31 October 2026. The remaining versions were not recorded by
+# those runs: they are the ones of the local development environment and must be
+# checked against the frozen environment before tagging.
+
 # Core Scientific and Data Manipulation
-numpy>=1.24.0
-pandas>=2.0.0
-scipy>=1.10.0
+numpy==2.4.6
+pandas==3.0.3
+scipy==1.17.1  # VERIFY against the Colab environment
 
 # File Formats and I/O
-openpyxl>=3.1.0
-pyarrow>=12.0.0
+openpyxl==3.1.5  # VERIFY against the Colab environment
+pyarrow==25.0.1  # VERIFY against the Colab environment
+# Not imported by any module and absent from the development environment, so no
+# version can be pinned: VERIFY against the Colab environment or remove.
 fastparquet>=2023.4.0
 
 # Machine Learning & Metrics
-scikit-learn>=1.9.0
-xgboost>=3.4.1
-lightgbm>=4.7.0
-shap>=0.54.1
-imbalanced-learn>=0.14.2
+scikit-learn==1.9.0
+xgboost==3.4.1
+lightgbm==4.7.0
+shap==0.54.1
+imbalanced-learn==0.14.2
 
 # Visualization and Spatial Mapping
-matplotlib>=3.7.0
-seaborn>=0.12.0
-folium>=0.15.0
+matplotlib==3.10.9  # VERIFY against the Colab environment
+seaborn==0.13.2  # VERIFY against the Colab environment
+folium==0.20.0  # VERIFY against the Colab environment
 
 # Utilities and Progress Monitoring
-tqdm>=4.65.0
+tqdm==4.70.1  # VERIFY against the Colab environment
 
 # Testing
-pytest>=8.0.0
+pytest==9.1.1  # VERIFY against the Colab environment

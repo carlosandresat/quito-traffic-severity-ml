@@ -30,6 +30,7 @@ from src.train_models import (
     SeverityModel,
     candidate_params,
     confirmatory_contrast,
+    content_sha256,
     contrast_reading,
     experiment_folds,
     fold_frames,
@@ -40,6 +41,7 @@ from src.train_models import (
     run_folds,
     run_metadata,
     selected_candidates,
+    session_canary,
     smote_nc_resample,
     trivial_references,
     weighted_average_precision,
@@ -975,6 +977,103 @@ def test_run_metadata_records_budget_environment_and_inputs(tmp_path):
     assert meta["config"]["n_candidates"] == 5 and meta["elapsed_seconds"] == 12.5
     assert meta["inputs"]["input.parquet"] == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     assert {"python", "packages", "cpu_count", "git_commit"} <= set(meta)
+
+
+def test_content_hash_depends_on_the_values_and_not_on_how_they_are_stored(tmp_path):
+    rng = np.random.default_rng(9)
+    frame = pd.DataFrame({"row": np.arange(200), "fold": rng.choice(["a", "b"], 200), "decided": rng.integers(0, 3, 200),
+                          "p0": rng.random(200), "p1": rng.random(200)})
+    reference = content_sha256(frame)
+    assert len(reference) == 64 and reference == content_sha256(frame.copy())
+    # Order of rows and columns, integer width and the file format do not matter.
+    assert content_sha256(frame.sample(frac=1.0, random_state=0)[["p1", "decided", "row", "p0", "fold"]]) == reference
+    assert content_sha256(frame.astype({"row": "int32", "decided": "int8"})) == reference
+    frame.to_parquet(tmp_path / "table.parquet", index=False)
+    assert content_sha256(pd.read_parquet(tmp_path / "table.parquet")) == reference
+    # Any value does: one unit in the last place of one probability changes the exact hash.
+    nudged = frame.copy()
+    nudged.loc[17, "p0"] = np.nextafter(nudged.loc[17, "p0"], 1.0)
+    assert content_sha256(nudged) != reference
+    assert content_sha256(nudged, decimals=6) == content_sha256(frame, decimals=6)
+    changed = frame.copy()
+    changed.loc[17, "p0"] += 1e-3
+    assert content_sha256(changed, decimals=6) != content_sha256(frame, decimals=6)
+    assert content_sha256(frame.assign(decided=(frame["decided"] + 1) % 3)) != reference
+    assert content_sha256(frame.rename(columns={"p0": "p2"})) != reference
+
+
+def test_run_metadata_records_full_provenance(monkeypatch, tmp_path):
+    import src.train_models as tm
+    monkeypatch.setenv("OMP_NUM_THREADS", "3")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    monkeypatch.setenv(tm.CANARY_VARIABLE, "abc123")
+    predictions = pd.DataFrame({"row": [0, 1], "p0": [0.25, 0.75]})
+    path = tmp_path / "logistic_predictions_anomalies.parquet"
+    predictions.to_parquet(path, index=False)
+    meta = run_metadata(ExperimentConfig(feature_set="timeonly", placebo_weather=None), [], 0.0, 1.0, outputs=[path])
+    assert {"git_commit", "git_tag", "git_dirty", "cpu_model", "cpu_count", "effective_cpu_count"} <= set(meta)
+    assert meta["config"]["feature_set"] == "timeonly" and meta["config"]["holdout"] is False
+    assert meta["thread_environment"]["OMP_NUM_THREADS"] == "3" and meta["thread_environment"]["MKL_NUM_THREADS"] is None
+    assert set(meta["thread_environment"]) == set(tm.THREAD_VARIABLES)
+    assert meta["session_canary_sha256"] == "abc123"
+    assert f"numpy=={np.__version__}" in meta["installed_packages"] and len(meta["installed_packages"]) > 10
+    assert {"numpy", "pandas", "scikit-learn", "xgboost", "lightgbm", "scipy", "pyarrow", "imbalanced-learn",
+            "shap"} <= set(meta["packages"])
+    assert meta["outputs"] == {path.name: {"sha256": tm._sha256(path), "content_sha256": content_sha256(predictions)}}
+    import json
+    assert json.loads(json.dumps(meta, default=str))["outputs"] == meta["outputs"]
+    monkeypatch.delenv(tm.CANARY_VARIABLE)
+    assert run_metadata(ExperimentConfig(), [], 0.0, 1.0)["session_canary_sha256"] is None
+
+
+def test_run_of_the_four_learners_ends_with_the_printed_contrast_and_a_canary(synthetic_study, monkeypatch,
+                                                                             tmp_path, capsys):
+    """End to end on synthetic data, as the canary run of a session: the four
+    learners with a reduced budget finish with the printed selection, and the
+    metadata record the predictions written, whose content gives the canary."""
+    import json
+    import src.train_models as tm
+    monkeypatch.setattr(tm, "effective_cpu_count", lambda: tm.XGBOOST_N_THREADS)
+    for name, space in {
+        "random_forest": {"n_estimators": [20], "max_depth": [4, 8], "min_samples_leaf": [5, 20],
+                          "max_features": ["sqrt"]},
+        "xgboost": {"n_estimators": [15, 30], "learning_rate": [0.1], "max_depth": [3], "min_child_weight": [1, 5],
+                    "subsample": [0.8], "colsample_bytree": [0.8]},
+        "lightgbm": {"n_estimators": [15, 30], "learning_rate": [0.1], "num_leaves": [7, 15],
+                     "min_child_samples": [5, 20], "subsample": [0.8], "subsample_freq": [1],
+                     "colsample_bytree": [0.8]},
+    }.items():
+        monkeypatch.setitem(tm.SEARCH_SPACES, name, space)
+    df, hourly = synthetic_study
+    df.to_parquet(tmp_path / "integrated_traffic_weather_quito.parquet")
+    hourly.to_parquet(tmp_path / "remmaq_meteorology_hourly.parquet")
+    reports, predictions = tmp_path / "reports", tmp_path / "predictions"
+    config = ExperimentConfig(n_candidates=2, bootstrap_replicates=20, first_train_year=2022)
+    out = train_main(config, report_dir=reports, prediction_dir=predictions, processed_dir=tmp_path)
+
+    # The run reaches its last line, after printing the selection of the contrast.
+    printed = capsys.readouterr().out
+    assert "=== Confirmatory contrast ===" in printed and "Contrast pending" not in printed
+    assert printed.rstrip().splitlines()[-1].startswith("Completed in")
+    assert out["contrast"]["selection"]["fold"].tolist() == ["2022-2023->2024", "2022-2024->2025"]
+    assert all(model in printed for model in out["contrast"]["selection"]["model"])
+    assert (reports / f"contrast_selection_{config.label}.csv").exists()
+
+    # Every file of predictions is recorded with the hash of its bytes and of its content.
+    meta = json.loads((reports / f"run_metadata_{config.label}_{'-'.join(MODELS)}.json").read_text("utf-8"))
+    assert sorted(meta["outputs"]) == sorted(f"{model}_{kind}_{config.label}.parquet" for model in MODELS
+                                             for kind in ("predictions", "candidates"))
+    for model in MODELS:
+        for kind in ("predictions", "candidates"):
+            entry = meta["outputs"][f"{model}_{kind}_{config.label}.parquet"]
+            assert entry["content_sha256"] == content_sha256(out[model][kind])
+            assert entry["sha256"] == tm._sha256(predictions / f"{model}_{kind}_{config.label}.parquet")
+
+    # The canary is the content hash of the predictions of the learners, read back from disk.
+    in_memory = pd.concat([out[model]["predictions"] for model in MODELS], ignore_index=True)
+    assert session_canary(predictions, config.label) == content_sha256(in_memory)
+    assert session_canary(predictions, config.label, models=["logistic"]) ==         meta["outputs"][f"logistic_predictions_{config.label}.parquet"]["content_sha256"]
+    assert session_canary(predictions, config.label, decimals=6) != session_canary(predictions, config.label)
 
 
 def test_xgboost_thread_count_is_fixed_by_the_study():
