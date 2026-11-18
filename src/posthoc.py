@@ -41,7 +41,7 @@ import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -57,8 +57,8 @@ if str(repo_root) not in sys.path:
 from src.decision import (DECISION_WEIGHT_GRID, EPSILON, N_CLASSES, DecisionRule, apply_temperature,
                           fit_temperature, rescale_prior)
 from src.features import previous_hour_weather
-from src.train_models import (CONFIGS, EQUIVALENCE_MARGIN, MODELS, RANDOM_STATE, _sha256, contrast_reading,
-                              selected_candidates)
+from src.train_models import (CONFIGS, EQUIVALENCE_MARGIN, MODELS, RANDOM_STATE, ExperimentConfig, _sha256,
+                              contrast_reading, selected_candidates)
 
 REPLICATES: int = 1000
 # Replicates of every seed in the seed mixture (plan §B.4).
@@ -1051,6 +1051,52 @@ READING_GROUPS: Dict[str, str] = {
     "worsening": "worsening", "worsening smaller than the margin": "worsening", "inconclusive": "inconclusive"}
 
 
+def run_commit(label: str, report_dir: Path) -> str:
+    """Commit that trained a run, from the metadata of its own label.
+
+    The pattern ``run_metadata_{label}_*.json`` also matches longer labels, so
+    each file is kept only if its configuration gives the requested label. The
+    files of the two processes of a run must record the same commit.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no metadata of the run is in ``report_dir``.
+    ValueError
+        If its metadata record no commit, or more than one.
+    """
+    known = {f.name for f in fields(ExperimentConfig)}
+    commits, found = set(), False
+    for path in sorted(report_dir.glob(f"run_metadata_{label}_*.json")):
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        config = ExperimentConfig(**{k: v for k, v in stored["config"].items() if k in known and k != "models"})
+        if config.label == label:
+            found = True
+            commits.add(stored.get("git_commit"))
+    if not found:
+        raise FileNotFoundError(f"No run metadata for {label} in {report_dir}")
+    if len(commits) != 1 or None in commits:
+        raise ValueError(f"The metadata of {label} record the commits {sorted(map(str, commits))}, not one")
+    return commits.pop()
+
+
+def same_commit(labels: Sequence[str], report_dir: Path) -> str:
+    """The single commit that trained every run of a seed mixture.
+
+    Guards against mixing runs of different campaigns that share a label, such
+    as the main run of 30 October and the seeds of the frozen campaign.
+
+    Raises
+    ------
+    ValueError
+        If the runs were trained by different commits.
+    """
+    commits = {label: run_commit(label, report_dir) for label in labels}
+    if len(set(commits.values())) != 1:
+        raise ValueError(f"The runs of the mixture come from different commits: {commits}")
+    return next(iter(commits.values()))
+
+
 def mixture_source(label: str, report_dir: Path, replicates: int = MIXTURE_REPLICATES) -> Tuple[Path, Path]:
     """Files of ``refit`` that the seed mixture reads for a run.
 
@@ -1268,9 +1314,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if args.command == "mixture":
         replicates = args.replicates or MIXTURE_REPLICATES
+        commit = same_commit(args.label, args.report_dir)
         _write(seed_mixture(args.label, args.report_dir, replicates), args.report_dir, label)
         files = [path for name in args.label for path in mixture_source(name, args.report_dir, replicates)]
-        meta = _metadata("mixture", args.label, files, replicates=replicates)
+        meta = _metadata("mixture", args.label, files, replicates=replicates, runs_commit=commit)
     elif args.command == "readings":
         replicates = args.replicates or REPLICATES
         readings, files = fixed_readings(label, args.report_dir, replicates)

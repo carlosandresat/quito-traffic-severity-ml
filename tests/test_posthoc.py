@@ -335,6 +335,37 @@ def test_runs_of_refit_with_another_budget_or_with_candidates_write_files_of_the
         contrast.unlink()
 
 
+def test_the_seed_mixture_refuses_runs_trained_by_different_commits(tmp_path):
+    import json
+    from dataclasses import asdict
+
+    main, seed = ExperimentConfig(), ExperimentConfig(seed=20261025, n_candidates=12)
+    assert seed.label == "anomalies_c12_b2000_s20261025"
+
+    def write(config, commit, group):
+        (tmp_path / f"run_metadata_{config.label}_{group}.json").write_text(
+            json.dumps({"config": asdict(config), "git_commit": commit}), encoding="utf-8")
+
+    # The main label is a prefix of the seed label: each keeps the commit of its own files.
+    write(main, "frozen", "logistic-random_forest-lightgbm")
+    write(main, "frozen", "xgboost")
+    write(seed, "frozen", "logistic-random_forest-lightgbm")
+    write(seed, "frozen", "xgboost")
+    assert ph.run_commit(main.label, tmp_path) == "frozen"
+    assert ph.same_commit([main.label, seed.label], tmp_path) == "frozen"
+    # The main run of another campaign, with the same label, cannot be mixed with the seeds.
+    write(main, "october", "logistic-random_forest-lightgbm")
+    write(main, "october", "xgboost")
+    with pytest.raises(ValueError, match="different commits"):
+        ph.same_commit([main.label, seed.label], tmp_path)
+    # The two processes of a run must agree, and a run without metadata cannot enter.
+    write(seed, "other", "xgboost")
+    with pytest.raises(ValueError, match="not one"):
+        ph.run_commit(seed.label, tmp_path)
+    with pytest.raises(FileNotFoundError):
+        ph.run_commit("anomalies_s20261102", tmp_path)
+
+
 # --- Pre-specified readings of the 2026 test and of the minimal baselines -----------------
 
 def test_readings_apply_the_fixed_rules_to_the_interval_with_the_rule_and_the_learner_refitted(tmp_path):
