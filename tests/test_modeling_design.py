@@ -722,7 +722,10 @@ def test_unweighted_and_placebo_runs_have_their_own_labels():
     # Seed 0 is a placebo too: only None means the observed weather.
     assert ExperimentConfig(placebo_weather=0).label == "anomalies_placebo0"
     assert ExperimentConfig(placebo_weather=None, class_weights=True).label == "anomalies"
-    assert ExperimentConfig(first_train_year=2019, class_weights=False, placebo_weather=2, holdout=True).label ==         "anomalies_from2019_unweighted_placebo2_holdout"
+    assert ExperimentConfig(first_train_year=2019, class_weights=False, holdout=True).label ==         "anomalies_from2019_unweighted_holdout"
+    assert ExperimentConfig(first_train_year=2019, class_weights=False, placebo_weather=2).label ==         "anomalies_from2019_unweighted_placebo2"
+    with pytest.raises(ValueError, match="cannot be combined with the 2026 test"):
+        ExperimentConfig(placebo_weather=2, holdout=True)
     with pytest.raises(ValueError, match="SMOTE-NC already fits without class weights"):
         ExperimentConfig(smote_nc=True, class_weights=False)
     for option in ({"crash_hour_weather": True}, {"feature_set": "timeonly"}):

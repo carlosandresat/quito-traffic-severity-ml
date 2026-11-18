@@ -264,6 +264,9 @@ class ExperimentConfig:
         if self.placebo_weather is not None and (self.crash_hour_weather or self.feature_set != "full"):
             raise ValueError("A placebo run exchanges the weather of the previous mark: it cannot be combined "
                              "with the crash-hour weather nor with a minimal baseline, which uses none.")
+        if self.placebo_weather is not None and self.holdout:
+            raise ValueError("A placebo run is read on the folds only: the 2026 crashes keep their own weather, "
+                             "so it cannot be combined with the 2026 test.")
         if self.feature_set != "full" and (self.raw_weather or self.crash_hour_weather
                                            or self.dispatch_scenario or self.smote_nc):
             raise ValueError("A minimal-baseline run uses no weather and no dispatch field and is not "
